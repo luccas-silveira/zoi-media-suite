@@ -1443,9 +1443,18 @@
         const videoNumber = i + 1;
 
         try {
-          // Upload
-          sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload...`;
-          const videoUrl = await uploadFile(videoFile, conversationId);
+          let videoUrl;
+
+          // Verificar se o vídeo veio da galeria (já tem URL)
+          if (videoFile.galleryUrl) {
+            log(`[Vídeo ${videoNumber}] Vídeo da galeria, usando URL existente: ${videoFile.galleryUrl}`);
+            videoUrl = videoFile.galleryUrl;
+          } else {
+            // Upload apenas se for arquivo local
+            sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload...`;
+            log(`[Vídeo ${videoNumber}] Fazendo upload de arquivo local: ${videoFile.name}`);
+            videoUrl = await uploadFile(videoFile, conversationId);
+          }
 
           // Update custom field
           sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Atualizando contato...`;
@@ -1944,6 +1953,10 @@
         type: media.contentType,
         lastModified: new Date(media.updatedAt).getTime()
       });
+
+      // IMPORTANTE: Adicionar URL da galeria ao File object
+      // Para que vídeos da galeria não precisem ser re-uploadados
+      file.galleryUrl = media.url;
 
       log(`Mídia convertida: ${media.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
       return file;
