@@ -19,7 +19,11 @@
     sendEndpoint: 'https://services.leadconnectorhq.com/conversations/messages',
     getMessagesEndpoint: 'https://services.leadconnectorhq.com/conversations',
     mediaLibraryEndpoint: 'https://services.leadconnectorhq.com/medias/files',
-    apiVersion: '2021-04-15'
+    apiVersion: '2021-04-15',
+    customFieldId: 'bKKZr3aVtoIuEOQfnSBm',
+    workflowId: '745fc4f4-9fc4-45d0-b865-92c0111adc67',
+    videoProcessingDelay: 5000,
+    contactsEndpoint: 'https://services.leadconnectorhq.com/contacts'
   };
 
   // Armazenar arquivos selecionados
@@ -1329,7 +1333,161 @@
   }
 
   // ============================================
-  // 16. EXTRAIR LOCATION ID DA URL
+  // 16. FUNÇÕES PARA PROCESSAMENTO DE VÍDEOS
+  // ============================================
+
+  /**
+   * Cria um delay baseado em Promise
+   * @param {number} ms - Milissegundos para aguardar
+   * @returns {Promise<void>}
+   */
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Atualiza o custom field de um contato com a URL do vídeo
+   * @param {string} contactId - ID do contato
+   * @param {string} videoUrl - URL do vídeo
+   * @returns {Promise<Object>} Resposta da API
+   */
+  async function updateContactCustomField(contactId, videoUrl) {
+    try {
+      log(`Atualizando custom field do contato ${contactId}`);
+
+      const response = await fetch(`${CONFIG.contactsEndpoint}/${contactId}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${CONFIG.apiKey}`,
+          'Version': CONFIG.apiVersion,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          customFields: [
+            {
+              id: CONFIG.customFieldId,
+              field_value: videoUrl
+            }
+          ]
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Erro ao atualizar custom field: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json();
+      log('Custom field atualizado com sucesso');
+      return result;
+
+    } catch (error) {
+      log(`ERRO ao atualizar custom field:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Adiciona contato a um workflow
+   * @param {string} contactId - ID do contato
+   * @returns {Promise<Object>} Resposta da API
+   */
+  async function addContactToWorkflow(contactId) {
+    try {
+      log(`Adicionando contato ${contactId} ao workflow`);
+
+      const response = await fetch(
+        `${CONFIG.contactsEndpoint}/${contactId}/workflow/${CONFIG.workflowId}`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CONFIG.apiKey}`,
+            'Version': CONFIG.apiVersion,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({})
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Erro ao adicionar ao workflow: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json();
+      log('Contato adicionado ao workflow com sucesso');
+      return result;
+
+    } catch (error) {
+      log(`ERRO ao adicionar contato ao workflow:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Processa vídeos sequencialmente: upload, atualizar custom field, adicionar ao workflow
+   * @param {Array<File>} videoFiles - Array de arquivos de vídeo
+   * @param {string} conversationId - ID da conversa
+   * @param {string} contactId - ID do contato
+   * @param {HTMLButtonElement} sendBtn - Botão de envio (para atualizar UI)
+   * @returns {Promise<Array>} Array com resultados do processamento
+   */
+  async function processVideos(videoFiles, conversationId, contactId, sendBtn) {
+    const results = [];
+
+    try {
+      log(`Processando ${videoFiles.length} vídeo(s)`);
+
+      for (let i = 0; i < videoFiles.length; i++) {
+        const videoFile = videoFiles[i];
+        const videoNumber = i + 1;
+
+        try {
+          // Upload
+          sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload...`;
+          const videoUrl = await uploadFile(videoFile, conversationId);
+
+          // Update custom field
+          sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Atualizando contato...`;
+          await updateContactCustomField(contactId, videoUrl);
+
+          // Add to workflow
+          sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Ativando workflow...`;
+          await addContactToWorkflow(contactId);
+
+          results.push({ file: videoFile.name, url: videoUrl, success: true });
+          log(`[Vídeo ${videoNumber}] Processado com sucesso`);
+
+          // Delay antes do próximo (exceto no último)
+          if (i < videoFiles.length - 1) {
+            sendBtn.innerHTML = `Aguardando ${CONFIG.videoProcessingDelay / 1000}s...`;
+            await delay(CONFIG.videoProcessingDelay);
+          }
+
+        } catch (videoError) {
+          log(`ERRO ao processar vídeo ${videoFile.name}:`, videoError);
+          results.push({ file: videoFile.name, success: false, error: videoError.message });
+
+          const continueProcessing = confirm(
+            `Erro ao processar vídeo "${videoFile.name}":\n${videoError.message}\n\nContinuar com próximos?`
+          );
+
+          if (!continueProcessing) {
+            throw new Error(`Processamento interrompido`);
+          }
+        }
+      }
+
+      return results;
+
+    } catch (error) {
+      log('ERRO no processamento de vídeos:', error);
+      throw error;
+    }
+  }
+
+  // ============================================
+  // 17. EXTRAIR LOCATION ID DA URL
   // ============================================
 
   function getLocationId() {
@@ -1901,7 +2059,7 @@
       // Extrair conversationId da URL
       const conversationId = getConversationId();
       if (!conversationId) {
-        throw new Error('Não foi possível identificar a conversa. Verifique a URL.');
+        throw new Error('Não foi possível identificar a conversa.');
       }
 
       // Buscar contactId das mensagens da conversa
@@ -1914,25 +2072,74 @@
 
       log(`Processando envio - ConversationId: ${conversationId}, ContactId: ${contactId}, Type: ${messageType}`);
 
-      // Upload de todos os arquivos
-      sendBtn.innerHTML = `Enviando arquivos (0/${selectedFiles.length})...`;
-      const uploadPromises = selectedFiles.map((file, index) =>
-        uploadFile(file, conversationId).then(url => {
-          sendBtn.innerHTML = `Enviando arquivos (${index + 1}/${selectedFiles.length})...`;
-          return url;
-        })
-      );
+      // ========================================
+      // SEPARAR VÍDEOS DE OUTRAS MÍDIAS
+      // ========================================
 
-      const attachmentUrls = await Promise.all(uploadPromises);
-      log('Todos os arquivos foram enviados:', attachmentUrls);
+      const videoFiles = selectedFiles.filter(file => file.type.startsWith('video/'));
+      const nonVideoFiles = selectedFiles.filter(file => !file.type.startsWith('video/'));
 
-      // Enviar mensagens com os anexos (uma por foto)
-      sendBtn.innerHTML = 'Enviando mensagens...';
-      await sendMessageWithAttachments(attachmentUrls, messageText, contactId, messageType);
+      log(`Separação: ${nonVideoFiles.length} imagem/áudio, ${videoFiles.length} vídeo(s)`);
 
-      // Sucesso!
+      // ========================================
+      // ETAPA 1: PROCESSAR IMAGENS/ÁUDIOS (SMS)
+      // ========================================
+
+      if (nonVideoFiles.length > 0) {
+        log('Processando imagens/áudios via SMS');
+
+        sendBtn.innerHTML = `Enviando imagens/áudios (0/${nonVideoFiles.length})...`;
+
+        const uploadPromises = nonVideoFiles.map((file, index) =>
+          uploadFile(file, conversationId).then(url => {
+            sendBtn.innerHTML = `Enviando imagens/áudios (${index + 1}/${nonVideoFiles.length})...`;
+            return url;
+          })
+        );
+
+        const nonVideoUrls = await Promise.all(uploadPromises);
+        log('Upload de imagens/áudios concluído:', nonVideoUrls);
+
+        sendBtn.innerHTML = 'Enviando mensagens SMS...';
+        await sendMessageWithAttachments(nonVideoUrls, messageText, contactId, messageType);
+        log('Imagens/áudios enviados via SMS');
+      } else {
+        log('Nenhuma imagem/áudio para processar via SMS');
+      }
+
+      // ========================================
+      // ETAPA 2: PROCESSAR VÍDEOS (CUSTOM FIELD + WORKFLOW)
+      // ========================================
+
+      if (videoFiles.length > 0) {
+        log('Processando vídeos via custom field + workflow');
+
+        const videoResults = await processVideos(
+          videoFiles,
+          conversationId,
+          contactId,
+          sendBtn
+        );
+
+        // Verificar se houve erros
+        const failedVideos = videoResults.filter(r => !r.success);
+        if (failedVideos.length > 0) {
+          log(`Alguns vídeos falharam: ${failedVideos.length}/${videoFiles.length}`);
+          const failedNames = failedVideos.map(v => `- ${v.file}: ${v.error}`).join('\n');
+          alert(`Atenção: ${failedVideos.length} vídeo(s) com erro:\n\n${failedNames}`);
+        }
+
+        log('Processamento de vídeos concluído:', videoResults);
+      } else {
+        log('Nenhum vídeo para processar');
+      }
+
+      // ========================================
+      // SUCESSO FINAL
+      // ========================================
+
       sendBtn.innerHTML = '✓ Enviado!';
-      log('Processo completo! Arquivos enviados com sucesso.');
+      log('Processo completo! Todos os arquivos foram processados.');
 
       // Fechar modal após 1 segundo
       setTimeout(() => {
