@@ -311,7 +311,7 @@
         flex: 1;
         overflow-y: auto;
         padding: 0 24px;
-        min-height: 100px;
+        min-height: 0;
         max-height: 300px;
       }
 
@@ -534,6 +534,7 @@
         gap: 16px;
         flex: 1;
         overflow: hidden;
+        min-height: 0;
       }
 
       /* ============================================ */
@@ -546,6 +547,8 @@
         display: flex;
         flex-direction: column;
         background: #f9fafb;
+        overflow: hidden;
+        min-height: 0;
       }
 
       #custom-media-upload-modal .sidebar-header {
@@ -654,6 +657,7 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
+        min-height: 0;
       }
 
       #custom-media-upload-modal .gallery-header {
@@ -682,6 +686,7 @@
         gap: 12px;
         padding: 16px;
         align-content: start;
+        min-height: 0;
       }
 
       #custom-media-upload-modal .media-item {
