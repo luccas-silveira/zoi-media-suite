@@ -1,4 +1,3 @@
-<script>
 (function() {
   'use strict';
 
@@ -520,7 +519,10 @@
       }
 
       #custom-media-upload-modal .tab-content.active {
-        display: block;
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        overflow: hidden;
       }
 
       /* ============================================ */
@@ -530,7 +532,7 @@
       #custom-media-upload-modal .gallery-container {
         display: flex;
         gap: 16px;
-        height: 450px;
+        flex: 1;
         overflow: hidden;
       }
 
@@ -1528,7 +1530,7 @@
       let html = `
         <div class="folder-item ${isActive ? 'active' : ''} ${hasChildren ? 'has-children' : ''}"
              data-folder-id="${folder._id}"
-             style="padding-left: ${level * 20 + 10}px;">
+             style="padding-left: ${level * 12 + 10}px;">
           ${hasChildren ? expandButton : '<div style="width: 20px;"></div>'}
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
@@ -2098,5 +2100,4 @@
 
   log('Script carregado e pronto');
 
-})();
-</script>
+})()
