@@ -1,0 +1,11 @@
+
+# Webhook auto-deploy files (server-side only)
+webhook-deploy.js
+webhook-manager.sh
+.env.webhook
+webhook-deploy.log
+WEBHOOK-SETUP.md
+public/
+
+# Temporary and log files
+*.log
