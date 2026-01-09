@@ -6,7 +6,7 @@
   // ============================================
 
   const CONFIG = {
-    targetHostname: 'https://app.zoitech.com.br',
+    targetHostname: 'app.zoitech.com.br',
     targetPathPattern: '/v2/location/Xb9gDxwxYhdqtprGcb5E/conversations/conversations',
     svgPathData: 'M17.5 5.256V16.5a5.5 5.5 0 11-11 0V5.667a3.667 3.667 0 017.333 0v10.779a1.833 1.833 0 11-3.666 0V6.65',
     acceptedFileTypes: 'image/*,video/*,audio/*',
