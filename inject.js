@@ -2290,12 +2290,23 @@
   // 20. INICIALIZAÇÃO PRINCIPAL
   // ============================================
 
+  let isInitialized = false;
+
   function init() {
     log('Iniciando script de upload de mídias...');
 
     if (!checkDomain()) {
+      log('URL atual não corresponde. Aguardando navegação para a location correta...');
       return;
     }
+
+    if (isInitialized) {
+      log('Script já inicializado, apenas buscando novos ícones...');
+      findAndModifyIcons();
+      return;
+    }
+
+    isInitialized = true;
 
     if (document.readyState === 'loading') {
       log('Aguardando DOMContentLoaded...');
@@ -2310,7 +2321,44 @@
   }
 
   // ============================================
-  // 21. EXECUTAR SCRIPT
+  // 21. MONITORAR MUDANÇAS DE URL (SPA)
+  // ============================================
+
+  let lastUrl = window.location.href;
+
+  function checkUrlChange() {
+    const currentUrl = window.location.href;
+    if (currentUrl !== lastUrl) {
+      lastUrl = currentUrl;
+      log('URL mudou para:', currentUrl);
+      // Re-tentar inicialização quando URL mudar
+      setTimeout(() => {
+        init();
+      }, 500);
+    }
+  }
+
+  // Monitorar mudanças de URL via pushState/replaceState
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
+
+  history.pushState = function(...args) {
+    originalPushState.apply(this, args);
+    checkUrlChange();
+  };
+
+  history.replaceState = function(...args) {
+    originalReplaceState.apply(this, args);
+    checkUrlChange();
+  };
+
+  window.addEventListener('popstate', checkUrlChange);
+
+  // Fallback: verificar URL periodicamente (para SPAs que não usam history API)
+  setInterval(checkUrlChange, 1000);
+
+  // ============================================
+  // 22. EXECUTAR SCRIPT
   // ============================================
 
   init();
@@ -2319,7 +2367,7 @@
   if (document.readyState !== 'complete') {
     window.addEventListener('load', () => {
       log('Window load event disparado, verificando novamente...');
-      findAndModifyIcons();
+      init();
     });
   }
 
