@@ -13,7 +13,7 @@
     maxFileSize: 5 * 1024 * 1024, // 5MB em bytes
     retryAttempts: 5,
     retryDelay: 500,
-    debugMode: true,
+    debugMode: false,
     apiKey: 'pit-6dfe1d34-d34f-4505-8c81-9fbbde7c564d',
     uploadEndpoint: 'https://services.leadconnectorhq.com/conversations/messages/upload',
     sendEndpoint: 'https://services.leadconnectorhq.com/conversations/messages',
