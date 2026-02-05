@@ -1276,8 +1276,7 @@
 
       const formData = new FormData();
       formData.append('file', file);
-      formData.append('hosted', 'true');
-      formData.append('fileProcessingType', 'video');
+      formData.append('hosted', 'false');
 
       const response = await fetch(
         `${CONFIG.mediaUploadEndpoint}?altId=${locationId}&altType=location`,
