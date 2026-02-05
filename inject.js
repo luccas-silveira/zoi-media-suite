@@ -10,7 +10,8 @@
     targetPathPattern: '/v2/location/cgrcdDk6fuaoP5KQ7scA/conversations/conversations',
     svgPathData: 'M17.5 5.256V16.5a5.5 5.5 0 11-11 0V5.667a3.667 3.667 0 017.333 0v10.779a1.833 1.833 0 11-3.666 0V6.65',
     acceptedFileTypes: 'image/*,video/*,audio/*',
-    maxFileSize: 5 * 1024 * 1024, // 5MB em bytes
+    maxFileSize: 5 * 1024 * 1024, // 5MB em bytes (conversations upload)
+    maxVideoFileSize: 500 * 1024 * 1024, // 500MB (Media Storage para vídeos)
     retryAttempts: 5,
     retryDelay: 500,
     debugMode: false,
@@ -19,6 +20,7 @@
     sendEndpoint: 'https://services.leadconnectorhq.com/conversations/messages',
     getMessagesEndpoint: 'https://services.leadconnectorhq.com/conversations',
     mediaLibraryEndpoint: 'https://services.leadconnectorhq.com/medias/files',
+    mediaUploadEndpoint: 'https://services.leadconnectorhq.com/medias/upload-file',
     apiVersion: '2021-04-15',
     customFieldId: 'te8xRD0EkEVmexDqultc',
     workflowId: '57418b05-0bf1-4cea-9822-e3a8e4193d6f',
@@ -1009,10 +1011,19 @@
             alert(`Imagem muito grande: ${file.name}\n\nTamanho após compressão: ${(processedFile.size / 1024 / 1024).toFixed(2)}MB\nMáximo permitido: ${maxSizeMB}MB\n\nTente usar uma imagem de qualidade inferior.`);
             continue;
           }
+        } else if (isVideo) {
+          // Vídeos >5MB serão enviados via Media Storage (limite 500MB)
+          const maxVideoSizeMB = (CONFIG.maxVideoFileSize / 1024 / 1024).toFixed(0);
+          if (file.size > CONFIG.maxVideoFileSize) {
+            log(`Vídeo muito grande: ${file.name} (${sizeMB}MB), máximo: ${maxVideoSizeMB}MB`);
+            alert(`Vídeo muito grande: ${file.name}\n\nTamanho: ${sizeMB}MB\nMáximo permitido: ${maxVideoSizeMB}MB\n\nPor favor, comprima o vídeo antes de enviar.`);
+            continue;
+          }
+          log(`Vídeo grande detectado (${sizeMB}MB), será enviado via Media Storage`);
         } else {
-          // Para vídeos e áudios, rejeitar
-          log(`${isVideo ? 'Vídeo' : 'Áudio'} muito grande: ${file.name} (${sizeMB}MB)`);
-          alert(`${isVideo ? 'Vídeo' : 'Áudio'} muito grande: ${file.name}\n\nTamanho: ${sizeMB}MB\nMáximo permitido: ${maxSizeMB}MB\n\nPor favor, comprima o ${isVideo ? 'vídeo' : 'áudio'} antes de enviar.`);
+          // Para áudios, rejeitar se > 5MB
+          log(`Áudio muito grande: ${file.name} (${sizeMB}MB)`);
+          alert(`Áudio muito grande: ${file.name}\n\nTamanho: ${sizeMB}MB\nMáximo permitido: ${maxSizeMB}MB\n\nPor favor, comprima o áudio antes de enviar.`);
           continue;
         }
       }
@@ -1250,6 +1261,61 @@
   }
 
   // ============================================
+  // 14.1 UPLOAD DE VÍDEO GRANDE VIA MEDIA STORAGE
+  // ============================================
+
+  async function uploadFileToMediaStorage(file) {
+    try {
+      const sizeMB = (file.size / 1024 / 1024).toFixed(2);
+      log(`Iniciando upload via Media Storage: ${file.name} (${sizeMB}MB)`);
+
+      const locationId = getLocationId();
+      if (!locationId) {
+        throw new Error('Location ID não encontrado para upload via Media Storage');
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('hosted', 'true');
+      formData.append('fileProcessingType', 'video');
+
+      const response = await fetch(
+        `${CONFIG.mediaUploadEndpoint}?altId=${locationId}&altType=location`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CONFIG.apiKey}`,
+            'Version': CONFIG.apiVersion
+          },
+          body: formData
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Erro no upload via Media Storage: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json();
+      log('Upload via Media Storage concluído:', result);
+
+      const fileUrl = result.url || (result.file && result.file.url) || result.fileUrl;
+
+      if (!fileUrl) {
+        log('ERRO: URL não encontrada no resultado do Media Storage. Estrutura:', result);
+        throw new Error('URL do arquivo não foi retornada pela API de Media Storage');
+      }
+
+      log(`URL do Media Storage: ${fileUrl}`);
+      return fileUrl;
+
+    } catch (error) {
+      log(`ERRO ao fazer upload via Media Storage ${file.name}:`, error);
+      throw error;
+    }
+  }
+
+  // ============================================
   // 15. ENVIAR MENSAGEM COM ANEXOS
   // ============================================
 
@@ -1449,8 +1515,13 @@
           if (videoFile.galleryUrl) {
             log(`[Vídeo ${videoNumber}] Vídeo da galeria, usando URL existente: ${videoFile.galleryUrl}`);
             videoUrl = videoFile.galleryUrl;
+          } else if (videoFile.size > CONFIG.maxFileSize) {
+            // Vídeo grande (>5MB): usar Media Storage (limite 500MB)
+            sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload (Media Storage)...`;
+            log(`[Vídeo ${videoNumber}] Vídeo grande (${(videoFile.size / 1024 / 1024).toFixed(2)}MB), usando Media Storage: ${videoFile.name}`);
+            videoUrl = await uploadFileToMediaStorage(videoFile);
           } else {
-            // Upload apenas se for arquivo local
+            // Vídeo pequeno (<=5MB): usar endpoint de conversas
             sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload...`;
             log(`[Vídeo ${videoNumber}] Fazendo upload de arquivo local: ${videoFile.name}`);
             videoUrl = await uploadFile(videoFile, conversationId);
