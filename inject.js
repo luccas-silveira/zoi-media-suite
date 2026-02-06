@@ -1187,6 +1187,37 @@
     ];
 
     let changed = false;
+
+    // Quando a conversa muda, limpa campos acoplados à conversa anterior
+    // para evitar uso de contact/provider stale entre requisições.
+    const hasNewConversationId =
+      partialState.conversationId !== undefined &&
+      partialState.conversationId !== null &&
+      partialState.conversationId !== '';
+    const conversationChanged =
+      hasNewConversationId &&
+      conversationResolverState.conversationId &&
+      partialState.conversationId !== conversationResolverState.conversationId;
+
+    if (conversationChanged) {
+      const conversationScopedKeys = [
+        'contactId',
+        'conversationType',
+        'conversationProviderId',
+        'lastMessageType',
+        'lastMessageConversationProviderId',
+        'assignedTo',
+        'searchTypeHint'
+      ];
+
+      for (const key of conversationScopedKeys) {
+        if (conversationResolverState[key] !== null) {
+          conversationResolverState[key] = null;
+          changed = true;
+        }
+      }
+    }
+
     for (const key of allowedKeys) {
       if (partialState[key] === undefined || partialState[key] === null || partialState[key] === '') continue;
       if (conversationResolverState[key] !== partialState[key]) {
@@ -1694,27 +1725,26 @@
             : conversationData;
 
         if (conversationRecord && typeof conversationRecord === 'object') {
-          if (!context.locationId && conversationRecord.locationId) {
+          if (conversationRecord.locationId) {
             context.locationId = conversationRecord.locationId;
           }
 
-          if (!context.contactId && conversationRecord.contactId) {
+          if (conversationRecord.contactId) {
             context.contactId = conversationRecord.contactId;
             log('ContactId extraído da conversa:', context.contactId);
           }
 
-          if ((context.conversationType === null || context.conversationType === undefined) && conversationRecord.type !== undefined) {
+          if (conversationRecord.type !== undefined) {
             context.conversationType = conversationRecord.type;
           }
 
-          if (!context.conversationProviderId) {
+          if (conversationRecord.conversationProviderId || conversationRecord.lastMessageConversationProviderId) {
             context.conversationProviderId =
               conversationRecord.conversationProviderId ||
-              conversationRecord.lastMessageConversationProviderId ||
-              null;
+              conversationRecord.lastMessageConversationProviderId;
           }
 
-          if (!context.lastMessageType && conversationRecord.lastMessageType) {
+          if (conversationRecord.lastMessageType) {
             context.lastMessageType = conversationRecord.lastMessageType;
           }
         }
@@ -1757,20 +1787,20 @@
               : null;
 
           if (lastMessage) {
-            if (!context.locationId && lastMessage.locationId) {
+            if (lastMessage.locationId) {
               context.locationId = lastMessage.locationId;
             }
 
-            if (!context.contactId && lastMessage.contactId) {
+            if (lastMessage.contactId) {
               context.contactId = lastMessage.contactId;
               log('ContactId extraído da última mensagem:', context.contactId);
             }
 
-            if (!context.conversationProviderId && lastMessage.conversationProviderId) {
+            if (lastMessage.conversationProviderId) {
               context.conversationProviderId = lastMessage.conversationProviderId;
             }
 
-            if (!context.lastMessageType && lastMessage.messageType) {
+            if (lastMessage.messageType) {
               context.lastMessageType = lastMessage.messageType;
             }
           }
