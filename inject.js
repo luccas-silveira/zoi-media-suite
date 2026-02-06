@@ -7,13 +7,14 @@
 
   const CONFIG = {
     targetHostname: 'app.zoitech.com.br',
-    targetPathPattern: '/v2/location/cgrcdDk6fuaoP5KQ7scA/conversations/conversations',
+    targetPathPattern: '/conversations/conversations',
     svgPathData: 'M17.5 5.256V16.5a5.5 5.5 0 11-11 0V5.667a3.667 3.667 0 017.333 0v10.779a1.833 1.833 0 11-3.666 0V6.65',
     acceptedFileTypes: 'image/*,video/*,audio/*',
     maxFileSize: 5 * 1024 * 1024, // 5MB em bytes (conversations upload)
     maxVideoFileSize: 500 * 1024 * 1024, // 500MB (Media Storage para vídeos)
     retryAttempts: 5,
     retryDelay: 500,
+    urlPollInterval: 2500,
     debugMode: false,
     apiKey: 'pit-6dfe1d34-d34f-4505-8c81-9fbbde7c564d',
     uploadEndpoint: 'https://services.leadconnectorhq.com/conversations/messages/upload',
@@ -25,7 +26,11 @@
     customFieldId: 'te8xRD0EkEVmexDqultc',
     workflowId: '57418b05-0bf1-4cea-9822-e3a8e4193d6f',
     videoProcessingDelay: 5000,
-    contactsEndpoint: 'https://services.leadconnectorhq.com/contacts'
+    contactsEndpoint: 'https://services.leadconnectorhq.com/contacts',
+    conversationContextTtlMs: 45 * 1000,
+    attachmentValidationMaxAttempts: 4,
+    attachmentValidationBaseDelayMs: 1200,
+    attachmentValidationFetchLimit: 30
   };
 
   // Armazenar arquivos selecionados
@@ -1136,60 +1141,675 @@
   }
 
   // ============================================
-  // 11. EXTRAIR CONVERSATION ID DA URL
+  // 11. RESOLVER CONTEXTO VIA NETWORK
   // ============================================
 
-  function getConversationId() {
-    // URL pattern: /conversations/conversations/{conversationId}
-    const pathParts = window.location.pathname.split('/');
-    const conversationsIndex = pathParts.lastIndexOf('conversations');
+  const conversationResolverState = {
+    conversationId: null,
+    locationId: null,
+    contactId: null,
+    conversationType: null,
+    conversationProviderId: null,
+    lastMessageType: null,
+    lastMessageConversationProviderId: null,
+    assignedTo: null,
+    searchTypeHint: null,
+    source: null,
+    updatedAt: 0
+  };
 
-    if (conversationsIndex !== -1 && pathParts.length > conversationsIndex + 1) {
-      const conversationId = pathParts[conversationsIndex + 1];
-      log('ConversationId extraído:', conversationId);
-      return conversationId;
+  let conversationPerformanceObserver = null;
+  let conversationObserverInitialized = false;
+  let networkInterceptorsInitialized = false;
+
+  const RESOURCE_SCAN_MIN_INTERVAL_MS = 250;
+  const RESOURCE_OBSERVER_BATCH_MS = 180;
+  let lastResourceScanAt = 0;
+  let lastProcessedResourceEntryCount = 0;
+  let pendingObservedEntries = [];
+  let pendingObservedEntriesTimer = null;
+  const conversationContextCache = new Map();
+  const conversationContextInflight = new Map();
+
+  function mergeResolverState(partialState, source = 'network') {
+    if (!partialState || typeof partialState !== 'object') return;
+
+    const allowedKeys = [
+      'conversationId',
+      'locationId',
+      'contactId',
+      'conversationType',
+      'conversationProviderId',
+      'lastMessageType',
+      'lastMessageConversationProviderId',
+      'assignedTo',
+      'searchTypeHint'
+    ];
+
+    let changed = false;
+    for (const key of allowedKeys) {
+      if (partialState[key] === undefined || partialState[key] === null || partialState[key] === '') continue;
+      if (conversationResolverState[key] !== partialState[key]) {
+        conversationResolverState[key] = partialState[key];
+        changed = true;
+      }
     }
 
-    log('ERRO: Não foi possível extrair conversationId da URL');
-    return null;
+    if (changed) {
+      conversationResolverState.source = source;
+      conversationResolverState.updatedAt = Date.now();
+      log('[Context Resolver] Estado atualizado:', {
+        conversationId: conversationResolverState.conversationId,
+        locationId: conversationResolverState.locationId,
+        contactId: conversationResolverState.contactId,
+        lastMessageType: conversationResolverState.lastMessageType,
+        conversationProviderId: conversationResolverState.conversationProviderId,
+        source: conversationResolverState.source
+      });
+    }
+  }
+
+  function setConversationId(id) {
+    mergeResolverState({ conversationId: id }, 'network:url');
+  }
+
+  function setLocationId(id) {
+    mergeResolverState({ locationId: id }, 'network:url');
+  }
+
+  function parseConversationIdFromUrl(urlString) {
+    try {
+      const url = new URL(urlString, window.location.origin);
+
+      const queryConversationId = url.searchParams.get('conversationId') || url.searchParams.get('conversation_id');
+      if (queryConversationId) {
+        return queryConversationId;
+      }
+
+      const pathMatch = url.pathname.match(/\/conversations\/([^\/?#]+)(?:\/messages)?$/i);
+      if (pathMatch && pathMatch[1]) {
+        const candidate = pathMatch[1];
+        const reserved = new Set(['messages', 'search', 'filters', 'providers', 'sla-settings']);
+        if (!reserved.has(candidate.toLowerCase())) {
+          return candidate;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function parseLocationIdFromUrl(urlString) {
+    try {
+      const url = new URL(urlString, window.location.origin);
+
+      const queryLocationId =
+        url.searchParams.get('locationId') ||
+        url.searchParams.get('location_id') ||
+        url.searchParams.get('altId') ||
+        url.searchParams.get('alt_id');
+
+      if (queryLocationId) {
+        return queryLocationId;
+      }
+
+      const pathLocationMatch = url.pathname.match(/\/v2\/location\/([^\/?#]+)/i);
+      if (pathLocationMatch && pathLocationMatch[1]) {
+        return pathLocationMatch[1];
+      }
+
+      const draftsLocationMatch = url.pathname.match(/\/conversations\/messages\/drafts\/([^\/?#]+)\/contacts\//i);
+      if (draftsLocationMatch && draftsLocationMatch[1]) {
+        return draftsLocationMatch[1];
+      }
+
+      const slaLocationMatch = url.pathname.match(/\/conversations\/sla-settings\/([^\/?#]+)/i);
+      if (slaLocationMatch && slaLocationMatch[1]) {
+        return slaLocationMatch[1];
+      }
+
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function parseContactIdFromUrl(urlString) {
+    try {
+      const url = new URL(urlString, window.location.origin);
+      const queryContactId = url.searchParams.get('contactId') || url.searchParams.get('contact_id');
+      if (queryContactId) {
+        return queryContactId;
+      }
+
+      const contactPathMatch = url.pathname.match(/\/contacts\/([^\/?#]+)/i);
+      if (contactPathMatch && contactPathMatch[1]) {
+        return contactPathMatch[1];
+      }
+
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function isConversationSearchResource(entry) {
+    if (!entry || !entry.name) return false;
+    if (entry.initiatorType !== 'fetch' && entry.initiatorType !== 'xmlhttprequest') return false;
+    return entry.name.includes('/conversations/messages/search');
+  }
+
+  function isNetworkResource(entry) {
+    if (!entry || !entry.name) return false;
+    return entry.initiatorType === 'fetch' || entry.initiatorType === 'xmlhttprequest';
+  }
+
+  function shouldInspectContextUrl(urlString) {
+    try {
+      const url = new URL(urlString, window.location.origin);
+      return url.pathname.includes('/conversations') || url.pathname.includes('/conversations-ai/employeeConfigs');
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function parseJsonSafe(value) {
+    if (typeof value !== 'string') return null;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function mapConversationRecordToResolverState(record) {
+    if (!record || typeof record !== 'object') return null;
+    const conversationProviderId =
+      record.conversationProviderId ||
+      record.lastMessageConversationProviderId ||
+      null;
+
+    return {
+      conversationId: record.id || record.conversationId || null,
+      locationId: record.locationId || null,
+      contactId: record.contactId || null,
+      conversationType: record.type ?? null,
+      assignedTo: record.assignedTo || null,
+      lastMessageType: record.lastMessageType || null,
+      lastMessageConversationProviderId: conversationProviderId,
+      conversationProviderId
+    };
+  }
+
+  function processContextFromUrl(urlString, source = 'network:url') {
+    if (!urlString) return;
+
+    const partial = {
+      conversationId: parseConversationIdFromUrl(urlString),
+      locationId: parseLocationIdFromUrl(urlString),
+      contactId: parseContactIdFromUrl(urlString)
+    };
+
+    try {
+      const url = new URL(urlString, window.location.origin);
+      if (url.pathname.includes('/conversations/messages/search')) {
+        const typeHint = url.searchParams.get('type');
+        if (typeHint) {
+          partial.searchTypeHint = String(typeHint).toUpperCase();
+        }
+      }
+    } catch (error) {
+      // no-op
+    }
+
+    mergeResolverState(partial, source);
+  }
+
+  function inspectNetworkPayload(urlString, payload, source = 'network:response') {
+    if (!payload || typeof payload !== 'object') return;
+
+    // /conversations/search/v2 => lista de conversas
+    if (Array.isArray(payload.conversations) && payload.conversations.length > 0) {
+      let conversationRecord = payload.conversations[0];
+      if (conversationResolverState.conversationId) {
+        conversationRecord =
+          payload.conversations.find(item => item.id === conversationResolverState.conversationId) ||
+          conversationRecord;
+      }
+
+      const partial = mapConversationRecordToResolverState(conversationRecord);
+      if (partial) {
+        mergeResolverState(partial, `${source}:search-v2`);
+      }
+      return;
+    }
+
+    // /conversations/{conversationId}
+    if ((payload.id || payload.conversationId) && payload.contactId && payload.locationId) {
+      const partial = mapConversationRecordToResolverState(payload);
+      if (partial) {
+        mergeResolverState(partial, `${source}:conversation`);
+      }
+      return;
+    }
+
+    // /conversations/{conversationId}/messages
+    if (payload.messages && Array.isArray(payload.messages.messages) && payload.messages.messages.length > 0) {
+      const latestMessage = payload.messages.messages[0];
+      mergeResolverState({
+        conversationId: latestMessage.conversationId || null,
+        locationId: latestMessage.locationId || null,
+        contactId: latestMessage.contactId || null,
+        conversationProviderId: latestMessage.conversationProviderId || null,
+        lastMessageConversationProviderId: latestMessage.conversationProviderId || null,
+        lastMessageType: latestMessage.messageType || null
+      }, `${source}:messages`);
+      return;
+    }
+
+    // /conversations/messages/search
+    if (payload.conversationId || payload.contactId || payload.locationId) {
+      mergeResolverState({
+        conversationId: payload.conversationId || null,
+        contactId: payload.contactId || null,
+        locationId: payload.locationId || null
+      }, `${source}:message-search`);
+      return;
+    }
+  }
+
+  function inspectRequestBodyForContext(urlString, method, body) {
+    if (!urlString || !shouldInspectContextUrl(urlString)) return;
+
+    let parsedBody = null;
+
+    if (typeof body === 'string') {
+      parsedBody = parseJsonSafe(body);
+    } else if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+      parsedBody = Object.fromEntries(body.entries());
+    } else if (typeof FormData !== 'undefined' && body instanceof FormData) {
+      parsedBody = {};
+      body.forEach((value, key) => {
+        parsedBody[key] = typeof value === 'string' ? value : '[binary]';
+      });
+    } else if (body && typeof body === 'object' && !Array.isArray(body)) {
+      parsedBody = body;
+    }
+
+    if (!parsedBody || typeof parsedBody !== 'object') return;
+
+    mergeResolverState({
+      conversationId: parsedBody.conversationId || parsedBody.conversation_id || null,
+      locationId: parsedBody.locationId || parsedBody.location_id || null,
+      contactId: parsedBody.contactId || parsedBody.contact_id || null
+    }, `network:request:${method}`);
+  }
+
+  function processResourceEntry(entry, source = 'network:resource') {
+    if (!isNetworkResource(entry)) return;
+    if (!shouldInspectContextUrl(entry.name)) return;
+    processContextFromUrl(entry.name, source);
+  }
+
+  function processResourceEntries(entries, source = 'network:resource-batch') {
+    if (!entries || entries.length === 0) return;
+    for (const entry of entries) {
+      processResourceEntry(entry, source);
+    }
+  }
+
+  function enqueueObservedEntries(entries) {
+    if (!entries || entries.length === 0) return;
+    pendingObservedEntries.push(...entries);
+
+    if (pendingObservedEntriesTimer) return;
+    pendingObservedEntriesTimer = setTimeout(() => {
+      const batch = pendingObservedEntries;
+      pendingObservedEntries = [];
+      pendingObservedEntriesTimer = null;
+      processResourceEntries(batch, 'network:performance-observer');
+    }, RESOURCE_OBSERVER_BATCH_MS);
+  }
+
+  function scanExistingResourceEntries(force = false) {
+    if (!window.performance || !performance.getEntriesByType) return;
+
+    const now = Date.now();
+    if (!force && now - lastResourceScanAt < RESOURCE_SCAN_MIN_INTERVAL_MS) return;
+    lastResourceScanAt = now;
+
+    const entries = performance.getEntriesByType('resource') || [];
+    if (entries.length < lastProcessedResourceEntryCount) {
+      lastProcessedResourceEntryCount = 0;
+    }
+
+    const startIndex = force ? 0 : lastProcessedResourceEntryCount;
+    for (let i = startIndex; i < entries.length; i++) {
+      processResourceEntry(entries[i], 'network:resource-scan');
+    }
+    lastProcessedResourceEntryCount = entries.length;
+  }
+
+  function initNetworkInterceptors() {
+    if (networkInterceptorsInitialized) return;
+    networkInterceptorsInitialized = true;
+
+    try {
+      if (typeof window.fetch === 'function') {
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async function(...args) {
+          const requestInfo = args[0];
+          const requestInit = args[1] || {};
+          const requestUrl = typeof requestInfo === 'string' ? requestInfo : (requestInfo && requestInfo.url) || '';
+          const requestMethod = String(requestInit.method || (requestInfo && requestInfo.method) || 'GET').toUpperCase();
+
+          if (requestUrl) {
+            processContextFromUrl(requestUrl, `network:fetch:${requestMethod}:request`);
+            inspectRequestBodyForContext(requestUrl, requestMethod, requestInit.body);
+          }
+
+          const response = await originalFetch(...args);
+
+          if (requestUrl && shouldInspectContextUrl(requestUrl)) {
+            try {
+              const contentType = response.headers.get('content-type') || '';
+              if (contentType.includes('application/json')) {
+                const cloned = response.clone();
+                const payload = await cloned.json();
+                inspectNetworkPayload(requestUrl, payload, `network:fetch:${requestMethod}:response`);
+              }
+            } catch (error) {
+              // payload parsing failure should never break page fetches
+            }
+          }
+
+          return response;
+        };
+      }
+    } catch (error) {
+      console.warn('[Context Resolver] Falha ao inicializar interceptor de fetch.', error);
+    }
+
+    try {
+      if (typeof XMLHttpRequest !== 'undefined') {
+        const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSend = XMLHttpRequest.prototype.send;
+
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          this.__mediaSuiteUrl = url;
+          this.__mediaSuiteMethod = String(method || 'GET').toUpperCase();
+          return originalOpen.call(this, method, url, ...rest);
+        };
+
+        XMLHttpRequest.prototype.send = function(body) {
+          try {
+            if (this.__mediaSuiteUrl) {
+              processContextFromUrl(this.__mediaSuiteUrl, `network:xhr:${this.__mediaSuiteMethod}:request`);
+              inspectRequestBodyForContext(this.__mediaSuiteUrl, this.__mediaSuiteMethod, body);
+            }
+          } catch (error) {
+            // no-op
+          }
+
+          this.addEventListener('load', () => {
+            try {
+              if (!this.__mediaSuiteUrl || !shouldInspectContextUrl(this.__mediaSuiteUrl)) return;
+              if (typeof this.responseText !== 'string' || this.responseText.length === 0) return;
+              const payload = parseJsonSafe(this.responseText);
+              if (payload) {
+                inspectNetworkPayload(this.__mediaSuiteUrl, payload, `network:xhr:${this.__mediaSuiteMethod}:response`);
+              }
+            } catch (error) {
+              // no-op
+            }
+          }, { once: true });
+
+          return originalSend.call(this, body);
+        };
+      }
+    } catch (error) {
+      console.warn('[Context Resolver] Falha ao inicializar interceptor de XMLHttpRequest.', error);
+    }
+  }
+
+  function initConversationObserver() {
+    if (conversationObserverInitialized) return;
+    conversationObserverInitialized = true;
+
+    try {
+      scanExistingResourceEntries(true);
+
+      if (typeof PerformanceObserver !== 'function') {
+        console.warn('[Conversation Resolver] PerformanceObserver indisponível neste navegador.');
+        return;
+      }
+
+      conversationPerformanceObserver = new PerformanceObserver((list) => {
+        enqueueObservedEntries(list.getEntries());
+      });
+
+      conversationPerformanceObserver.observe({ entryTypes: ['resource'] });
+    } catch (error) {
+      console.warn('[Conversation Resolver] Falha ao iniciar observer de network.', error);
+    }
+  }
+
+  function getConversationId() {
+    scanExistingResourceEntries();
+    return conversationResolverState.conversationId;
+  }
+
+  function getLocationId() {
+    scanExistingResourceEntries();
+    return conversationResolverState.locationId;
+  }
+
+  function getResolverSnapshot() {
+    scanExistingResourceEntries();
+    return { ...conversationResolverState };
+  }
+
+  function getCachedConversationContext(conversationId) {
+    const cachedEntry = conversationContextCache.get(conversationId);
+    if (!cachedEntry) return null;
+
+    if (cachedEntry.expiresAt <= Date.now()) {
+      conversationContextCache.delete(conversationId);
+      return null;
+    }
+
+    return { ...cachedEntry.value };
+  }
+
+  function setCachedConversationContext(conversationId, context) {
+    conversationContextCache.set(conversationId, {
+      value: { ...context },
+      expiresAt: Date.now() + CONFIG.conversationContextTtlMs
+    });
   }
 
   // ============================================
   // 12. BUSCAR CONTACT ID DA CONVERSA
   // ============================================
 
-  async function getContactIdFromConversation(conversationId) {
-    try {
-      log(`Buscando mensagens da conversa: ${conversationId}`);
+  async function getConversationContext(conversationId) {
+    if (!conversationId) {
+      throw new Error('ConversationId é obrigatório para obter o contexto.');
+    }
 
-      const response = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=1`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${CONFIG.apiKey}`,
-          'Version': CONFIG.apiVersion
+    const cachedContext = getCachedConversationContext(conversationId);
+    if (cachedContext) {
+      log(`Contexto da conversa ${conversationId} carregado do cache`);
+      return cachedContext;
+    }
+
+    if (conversationContextInflight.has(conversationId)) {
+      log(`Reutilizando busca de contexto em andamento para ${conversationId}`);
+      return conversationContextInflight.get(conversationId);
+    }
+
+    const contextPromise = (async () => {
+      const resolverSnapshot = getResolverSnapshot();
+      const snapshotMatchesConversation =
+        !resolverSnapshot.conversationId || resolverSnapshot.conversationId === conversationId;
+
+      const context = {
+        conversationId,
+        locationId: snapshotMatchesConversation ? resolverSnapshot.locationId || null : null,
+        contactId: snapshotMatchesConversation ? resolverSnapshot.contactId || null : null,
+        conversationType: snapshotMatchesConversation ? resolverSnapshot.conversationType ?? null : null,
+        conversationProviderId: snapshotMatchesConversation
+          ? (resolverSnapshot.conversationProviderId || resolverSnapshot.lastMessageConversationProviderId || null)
+          : null,
+        lastMessageType: snapshotMatchesConversation ? resolverSnapshot.lastMessageType || null : null,
+        searchTypeHint: snapshotMatchesConversation ? resolverSnapshot.searchTypeHint || null : null,
+        messageType: 'SMS'
+      };
+
+      // 1) Buscar dados da conversa (fonte primária para contactId e tipo)
+      try {
+        log(`Buscando dados da conversa: ${conversationId}`);
+
+        const conversationResponse = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${CONFIG.apiKey}`,
+            'Version': CONFIG.apiVersion
+          }
+        });
+
+        if (!conversationResponse.ok) {
+          const errorText = await conversationResponse.text();
+          throw new Error(`Erro ao buscar conversa: ${conversationResponse.status} - ${errorText}`);
         }
-      });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Erro ao buscar mensagens: ${response.status} - ${errorText}`);
+        const conversationData = await conversationResponse.json();
+        log('Resposta da API de conversa:', conversationData);
+
+        const conversationRecord =
+          conversationData && typeof conversationData === 'object' && conversationData.conversation
+            ? conversationData.conversation
+            : conversationData;
+
+        if (conversationRecord && typeof conversationRecord === 'object') {
+          if (!context.locationId && conversationRecord.locationId) {
+            context.locationId = conversationRecord.locationId;
+          }
+
+          if (!context.contactId && conversationRecord.contactId) {
+            context.contactId = conversationRecord.contactId;
+            log('ContactId extraído da conversa:', context.contactId);
+          }
+
+          if ((context.conversationType === null || context.conversationType === undefined) && conversationRecord.type !== undefined) {
+            context.conversationType = conversationRecord.type;
+          }
+
+          if (!context.conversationProviderId) {
+            context.conversationProviderId =
+              conversationRecord.conversationProviderId ||
+              conversationRecord.lastMessageConversationProviderId ||
+              null;
+          }
+
+          if (!context.lastMessageType && conversationRecord.lastMessageType) {
+            context.lastMessageType = conversationRecord.lastMessageType;
+          }
+        }
+      } catch (error) {
+        log('ERRO ao buscar dados da conversa:', error);
       }
 
-      const result = await response.json();
-      log('Resposta da API de mensagens:', result);
+      // 2) Fallback na API de mensagens para provider/tipo quando necessário
+      const shouldFetchMessagesFallback =
+        !context.contactId ||
+        !context.lastMessageType ||
+        !context.conversationProviderId;
 
-      // Extrair contactId da primeira mensagem
-      if (result.messages && result.messages.messages && result.messages.messages.length > 0) {
-        const contactId = result.messages.messages[0].contactId;
-        log('ContactId extraído das mensagens:', contactId);
-        return contactId;
+      if (shouldFetchMessagesFallback) {
+        try {
+          log(`Buscando última mensagem da conversa: ${conversationId}`);
+
+          const messagesResponse = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=1`, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${CONFIG.apiKey}`,
+              'Version': CONFIG.apiVersion
+            }
+          });
+
+          if (!messagesResponse.ok) {
+            const errorText = await messagesResponse.text();
+            throw new Error(`Erro ao buscar mensagens: ${messagesResponse.status} - ${errorText}`);
+          }
+
+          const messagesResult = await messagesResponse.json();
+          log('Resposta da API de mensagens:', messagesResult);
+
+          const lastMessage =
+            messagesResult &&
+            messagesResult.messages &&
+            messagesResult.messages.messages &&
+            messagesResult.messages.messages.length > 0
+              ? messagesResult.messages.messages[0]
+              : null;
+
+          if (lastMessage) {
+            if (!context.locationId && lastMessage.locationId) {
+              context.locationId = lastMessage.locationId;
+            }
+
+            if (!context.contactId && lastMessage.contactId) {
+              context.contactId = lastMessage.contactId;
+              log('ContactId extraído da última mensagem:', context.contactId);
+            }
+
+            if (!context.conversationProviderId && lastMessage.conversationProviderId) {
+              context.conversationProviderId = lastMessage.conversationProviderId;
+            }
+
+            if (!context.lastMessageType && lastMessage.messageType) {
+              context.lastMessageType = lastMessage.messageType;
+            }
+          }
+        } catch (error) {
+          log('ERRO ao buscar fallback de mensagens da conversa:', error);
+        }
       }
 
-      throw new Error('Nenhuma mensagem encontrada na conversa para extrair contactId');
+      if (!context.contactId) {
+        throw new Error('Não foi possível identificar o contactId da conversa.');
+      }
 
-    } catch (error) {
-      log('ERRO ao buscar contactId da conversa:', error);
-      throw error;
+      context.messageType = detectMessageType(context);
+
+      if (context.messageType === 'Custom' && !context.conversationProviderId) {
+        throw new Error('Conversa do tipo Custom sem conversationProviderId disponível.');
+      }
+
+      mergeResolverState({
+        conversationId: context.conversationId,
+        locationId: context.locationId,
+        contactId: context.contactId,
+        conversationType: context.conversationType,
+        conversationProviderId: context.conversationProviderId,
+        lastMessageConversationProviderId: context.conversationProviderId,
+        lastMessageType: context.lastMessageType,
+        searchTypeHint: context.searchTypeHint
+      }, 'conversation-context');
+
+      setCachedConversationContext(conversationId, context);
+      return { ...context };
+    })();
+
+    conversationContextInflight.set(conversationId, contextPromise);
+
+    try {
+      return await contextPromise;
+    } finally {
+      conversationContextInflight.delete(conversationId);
     }
   }
 
@@ -1197,9 +1817,67 @@
   // 13. DETECTAR TIPO DE MENSAGEM
   // ============================================
 
-  function detectMessageType() {
-    // Sempre retornar SMS como padrão
-    log('Tipo de mensagem: SMS');
+  function detectMessageType(context = {}) {
+    const rawMessageType = String(context.lastMessageType || '').toUpperCase();
+    const rawSearchTypeHint = String(context.searchTypeHint || '').toUpperCase();
+    const typeHint = `${rawMessageType} ${rawSearchTypeHint}`.trim();
+    const conversationType = Number(context.conversationType);
+
+    if (typeHint.includes('CUSTOM')) {
+      log('Tipo de mensagem detectado: Custom');
+      return 'Custom';
+    }
+
+    if (typeHint.includes('WHATSAPP')) {
+      log('Tipo de mensagem detectado: WhatsApp');
+      return 'WhatsApp';
+    }
+
+    if (
+      typeHint.includes('FACEBOOK') ||
+      typeHint.includes('MESSENGER') ||
+      typeHint.includes('_FB')
+    ) {
+      log('Tipo de mensagem detectado: FB');
+      return 'FB';
+    }
+
+    if (
+      typeHint.includes('INSTAGRAM') ||
+      typeHint.includes('_IG') ||
+      typeHint.includes('TYPE_IG')
+    ) {
+      log('Tipo de mensagem detectado: IG');
+      return 'IG';
+    }
+
+    if (typeHint.includes('EMAIL')) {
+      log('Tipo de mensagem detectado: Email');
+      return 'Email';
+    }
+
+    if (typeHint.includes('LIVE_CHAT')) {
+      log('Tipo de mensagem detectado: Live_Chat');
+      return 'Live_Chat';
+    }
+
+    if (typeHint.includes('INTERNAL')) {
+      log('Tipo de mensagem detectado: InternalComment');
+      return 'InternalComment';
+    }
+
+    // Fallback com base no tipo numérico da conversa
+    if (conversationType === 2) {
+      log('Tipo de mensagem detectado por fallback: Email');
+      return 'Email';
+    }
+
+    if (conversationType === 3) {
+      log('Tipo de mensagem detectado por fallback: FB');
+      return 'FB';
+    }
+
+    log('Tipo de mensagem detectado por fallback: SMS');
     return 'SMS';
   }
 
@@ -1271,7 +1949,7 @@
 
       const locationId = getLocationId();
       if (!locationId) {
-        throw new Error('Location ID não encontrado para upload via Media Storage');
+        throw new Error('Location ID não encontrado via network para upload via Media Storage');
       }
 
       const formData = new FormData();
@@ -1318,20 +1996,27 @@
   // 15. ENVIAR MENSAGEM COM ANEXOS
   // ============================================
 
-  async function sendMessageWithAttachments(attachmentUrls, messageText, contactId, messageType) {
+  async function sendMessageWithAttachments(attachmentUrls, messageText, conversationContext) {
     try {
       log('Enviando mensagens com anexos...');
 
       const results = [];
+      const basePayload = {
+        type: conversationContext.messageType,
+        contactId: conversationContext.contactId,
+        status: 'pending'
+      };
+
+      if (conversationContext.conversationProviderId) {
+        basePayload.conversationProviderId = conversationContext.conversationProviderId;
+      }
 
       // Se houver texto, enviar a mensagem de texto primeiro
       if (messageText) {
         log('Enviando mensagem de texto...');
         const textPayload = {
-          type: messageType,
-          contactId: contactId,
+          ...basePayload,
           message: messageText,
-          status: 'pending'
         };
 
         const textResponse = await fetch(CONFIG.sendEndpoint, {
@@ -1360,10 +2045,8 @@
         log(`Enviando foto ${i + 1}/${attachmentUrls.length}: ${url}`);
 
         const payload = {
-          type: messageType,
-          contactId: contactId,
+          ...basePayload,
           attachments: [url],  // Array com apenas uma URL (string)
-          status: 'pending'
         };
 
         log('Payload da mensagem:', payload);
@@ -1395,6 +2078,232 @@
       log('ERRO ao enviar mensagens:', error);
       throw error;
     }
+  }
+
+  function normalizeAttachmentUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+
+    try {
+      const parsed = new URL(url, window.location.origin);
+      const normalizedPath = parsed.pathname.replace(/\/+$/, '');
+      return `${parsed.origin}${normalizedPath}`.toLowerCase();
+    } catch (error) {
+      return String(url).split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
+    }
+  }
+
+  function extractFileNameFromUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+
+    try {
+      const parsed = new URL(url, window.location.origin);
+      const pathParts = parsed.pathname.split('/').filter(Boolean);
+      if (pathParts.length === 0) return null;
+      return decodeURIComponent(pathParts[pathParts.length - 1]).toLowerCase();
+    } catch (error) {
+      const withoutQuery = String(url).split('#')[0].split('?')[0];
+      const segments = withoutQuery.split('/').filter(Boolean);
+      return segments.length > 0 ? segments[segments.length - 1].toLowerCase() : null;
+    }
+  }
+
+  function collectAttachmentUrlsFromValue(value, collector) {
+    if (!value) return;
+
+    if (typeof value === 'string') {
+      if (value.startsWith('http://') || value.startsWith('https://')) {
+        collector.push(value);
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach(item => collectAttachmentUrlsFromValue(item, collector));
+      return;
+    }
+
+    if (typeof value !== 'object') return;
+
+    const directUrl =
+      value.url ||
+      value.link ||
+      value.fileUrl ||
+      value.secureUrl ||
+      value.src ||
+      value.previewUrl;
+
+    if (typeof directUrl === 'string') {
+      collector.push(directUrl);
+    }
+
+    const nestedKeys = ['attachments', 'attachment', 'files', 'file', 'media', 'images', 'videos', 'asset'];
+    nestedKeys.forEach(key => {
+      if (value[key] !== undefined) {
+        collectAttachmentUrlsFromValue(value[key], collector);
+      }
+    });
+  }
+
+  function extractAttachmentUrlsFromMessage(message) {
+    if (!message || typeof message !== 'object') return [];
+
+    const collected = [];
+    const fieldsToInspect = ['attachments', 'attachment', 'files', 'file', 'media', 'images', 'videos', 'asset'];
+
+    fieldsToInspect.forEach(field => {
+      if (message[field] !== undefined) {
+        collectAttachmentUrlsFromValue(message[field], collected);
+      }
+    });
+
+    return Array.from(new Set(collected));
+  }
+
+  async function fetchRecentMessages(conversationId, limit = CONFIG.attachmentValidationFetchLimit) {
+    const response = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=${limit}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${CONFIG.apiKey}`,
+        'Version': CONFIG.apiVersion
+      }
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Erro ao buscar mensagens para validação: ${response.status} - ${errorText}`);
+    }
+
+    const payload = await response.json();
+
+    if (payload && payload.messages && Array.isArray(payload.messages.messages)) {
+      return payload.messages.messages;
+    }
+
+    if (payload && Array.isArray(payload.messages)) {
+      return payload.messages;
+    }
+
+    if (payload && Array.isArray(payload.data)) {
+      return payload.data;
+    }
+
+    return [];
+  }
+
+  function evaluateAttachmentDelivery(messages, expectedAttachmentUrls) {
+    const expectedDescriptors = expectedAttachmentUrls
+      .filter(url => typeof url === 'string' && url.trim())
+      .map(rawUrl => ({
+        rawUrl,
+        normalizedUrl: normalizeAttachmentUrl(rawUrl),
+        fileName: extractFileNameFromUrl(rawUrl)
+      }));
+
+    const observedNormalizedUrls = new Set();
+    const observedFileNames = new Set();
+
+    messages.forEach(message => {
+      const messageAttachmentUrls = extractAttachmentUrlsFromMessage(message);
+      messageAttachmentUrls.forEach(url => {
+        const normalized = normalizeAttachmentUrl(url);
+        if (normalized) {
+          observedNormalizedUrls.add(normalized);
+        }
+
+        const fileName = extractFileNameFromUrl(url);
+        if (fileName) {
+          observedFileNames.add(fileName);
+        }
+      });
+    });
+
+    const deliveredUrls = [];
+    const missingUrls = [];
+
+    expectedDescriptors.forEach(descriptor => {
+      const deliveredByUrl =
+        descriptor.normalizedUrl && observedNormalizedUrls.has(descriptor.normalizedUrl);
+      const deliveredByFileName =
+        descriptor.fileName && observedFileNames.has(descriptor.fileName);
+
+      if (deliveredByUrl || deliveredByFileName) {
+        deliveredUrls.push(descriptor.rawUrl);
+      } else {
+        missingUrls.push(descriptor.rawUrl);
+      }
+    });
+
+    return { deliveredUrls, missingUrls };
+  }
+
+  async function validateAttachmentDelivery(conversationId, expectedAttachmentUrls) {
+    const expectedUrls = Array.isArray(expectedAttachmentUrls)
+      ? expectedAttachmentUrls.filter(url => typeof url === 'string' && url.trim())
+      : [];
+
+    if (expectedUrls.length === 0) {
+      return {
+        ok: true,
+        attempts: 0,
+        deliveredUrls: [],
+        missingUrls: []
+      };
+    }
+
+    let lastEvaluation = {
+      deliveredUrls: [],
+      missingUrls: expectedUrls.slice()
+    };
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= CONFIG.attachmentValidationMaxAttempts; attempt++) {
+      try {
+        const messages = await fetchRecentMessages(conversationId, CONFIG.attachmentValidationFetchLimit);
+        lastEvaluation = evaluateAttachmentDelivery(messages, expectedUrls);
+
+        log(
+          `[Validação de anexos] Tentativa ${attempt}/${CONFIG.attachmentValidationMaxAttempts}: ` +
+          `${lastEvaluation.deliveredUrls.length}/${expectedUrls.length} confirmado(s)`
+        );
+
+        if (lastEvaluation.missingUrls.length === 0) {
+          return {
+            ok: true,
+            attempts: attempt,
+            deliveredUrls: lastEvaluation.deliveredUrls,
+            missingUrls: []
+          };
+        }
+      } catch (error) {
+        lastError = error;
+        log(`[Validação de anexos] Erro na tentativa ${attempt}:`, error);
+      }
+
+      if (attempt < CONFIG.attachmentValidationMaxAttempts) {
+        await delay(CONFIG.attachmentValidationBaseDelayMs * attempt);
+      }
+    }
+
+    return {
+      ok: false,
+      attempts: CONFIG.attachmentValidationMaxAttempts,
+      deliveredUrls: lastEvaluation.deliveredUrls,
+      missingUrls: lastEvaluation.missingUrls,
+      error: lastError ? lastError.message : null
+    };
+  }
+
+  async function uploadFilesWithProgress(files, conversationId, sendBtn) {
+    const uploadedUrls = [];
+
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      sendBtn.innerHTML = `Upload de imagens/áudios (${index + 1}/${files.length})...`;
+      const uploadedUrl = await uploadFile(file, conversationId);
+      uploadedUrls.push(uploadedUrl);
+    }
+
+    return uploadedUrls;
   }
 
   // ============================================
@@ -1566,28 +2475,13 @@
   }
 
   // ============================================
-  // 17. EXTRAIR LOCATION ID DA URL
-  // ============================================
-
-  function getLocationId() {
-    // URL: /v2/location/{LOCATION_ID}/conversations/...
-    const match = window.location.pathname.match(/\/location\/([^\/]+)/);
-    if (match && match[1]) {
-      log('Location ID extraído:', match[1]);
-      return match[1];
-    }
-    log('ERRO: Não foi possível extrair Location ID da URL');
-    return null;
-  }
-
-  // ============================================
   // 17. BUSCAR PASTAS DE MÍDIA
   // ============================================
 
   async function fetchMediaFolders() {
     const locationId = getLocationId();
     if (!locationId) {
-      throw new Error('Location ID não encontrado');
+      throw new Error('Location ID não encontrado via network');
     }
 
     mediaLibraryState.loading.folders = true;
@@ -2139,21 +3033,20 @@
       sendBtn.disabled = true;
       sendBtn.innerHTML = 'Processando...';
 
-      // Extrair conversationId da URL
+      // Resolver conversationId via observer de network
       const conversationId = getConversationId();
       if (!conversationId) {
-        throw new Error('Não foi possível identificar a conversa.');
+        throw new Error('Não foi possível identificar a conversa via network. Abra a conversa e aguarde carregar as mensagens.');
       }
 
-      // Buscar contactId das mensagens da conversa
+      // Buscar contexto completo da conversa
       sendBtn.innerHTML = 'Buscando informações...';
-      const contactId = await getContactIdFromConversation(conversationId);
-
-      // Detectar tipo de mensagem
-      const messageType = detectMessageType();
+      const conversationContext = await getConversationContext(conversationId);
+      const contactId = conversationContext.contactId;
+      const messageType = conversationContext.messageType;
       const messageText = messageTextarea ? messageTextarea.value.trim() : '';
 
-      log(`Processando envio - ConversationId: ${conversationId}, ContactId: ${contactId}, Type: ${messageType}`);
+      log(`Processando envio - ConversationId: ${conversationId}, ContactId: ${contactId}, Type: ${messageType}, Provider: ${conversationContext.conversationProviderId || 'n/a'}`);
 
       // ========================================
       // SEPARAR VÍDEOS DE OUTRAS MÍDIAS
@@ -2165,29 +3058,32 @@
       log(`Separação: ${nonVideoFiles.length} imagem/áudio, ${videoFiles.length} vídeo(s)`);
 
       // ========================================
-      // ETAPA 1: PROCESSAR IMAGENS/ÁUDIOS (SMS)
+      // ETAPA 1: PROCESSAR IMAGENS/ÁUDIOS (chat)
       // ========================================
 
       if (nonVideoFiles.length > 0) {
-        log('Processando imagens/áudios via SMS');
+        log('Processando imagens/áudios para envio no chat');
 
-        sendBtn.innerHTML = `Enviando imagens/áudios (0/${nonVideoFiles.length})...`;
-
-        const uploadPromises = nonVideoFiles.map((file, index) =>
-          uploadFile(file, conversationId).then(url => {
-            sendBtn.innerHTML = `Enviando imagens/áudios (${index + 1}/${nonVideoFiles.length})...`;
-            return url;
-          })
-        );
-
-        const nonVideoUrls = await Promise.all(uploadPromises);
+        sendBtn.innerHTML = `Upload de imagens/áudios (0/${nonVideoFiles.length})...`;
+        const nonVideoUrls = await uploadFilesWithProgress(nonVideoFiles, conversationId, sendBtn);
         log('Upload de imagens/áudios concluído:', nonVideoUrls);
 
-        sendBtn.innerHTML = 'Enviando mensagens SMS...';
-        await sendMessageWithAttachments(nonVideoUrls, messageText, contactId, messageType);
-        log('Imagens/áudios enviados via SMS');
+        sendBtn.innerHTML = 'Enviando mensagens...';
+        await sendMessageWithAttachments(nonVideoUrls, messageText, conversationContext);
+
+        sendBtn.innerHTML = 'Validando envio das mídias...';
+        const deliveryValidation = await validateAttachmentDelivery(conversationId, nonVideoUrls);
+        if (!deliveryValidation.ok) {
+          log('Falha na validação de entrega das mídias:', deliveryValidation);
+          throw new Error(
+            `As mídias foram enviadas, mas ${deliveryValidation.missingUrls.length} anexo(s) ` +
+            `não apareceram no chat após ${deliveryValidation.attempts} tentativa(s).`
+          );
+        }
+
+        log('Imagens/áudios enviados e validados no chat');
       } else {
-        log('Nenhuma imagem/áudio para processar via SMS');
+        log('Nenhuma imagem/áudio para processar');
       }
 
       // ========================================
@@ -2370,6 +3266,11 @@
       return;
     }
 
+    // Garante resolução de contexto via tráfego de rede
+    initNetworkInterceptors();
+    initConversationObserver();
+    scanExistingResourceEntries();
+
     if (isInitialized) {
       log('Script já inicializado, apenas buscando novos ícones...');
       findAndModifyIcons();
@@ -2425,7 +3326,7 @@
   window.addEventListener('popstate', checkUrlChange);
 
   // Fallback: verificar URL periodicamente (para SPAs que não usam history API)
-  setInterval(checkUrlChange, 1000);
+  setInterval(checkUrlChange, CONFIG.urlPollInterval);
 
   // ============================================
   // 22. EXECUTAR SCRIPT
