@@ -28,10 +28,18 @@
     videoProcessingDelay: 5000,
     contactsEndpoint: 'https://services.leadconnectorhq.com/contacts',
     conversationContextTtlMs: 45 * 1000,
+    conversationContextCacheMaxEntries: 180,
     conversationIntentTtlMs: 10 * 1000,
+    conversationSignalWindowMs: 5 * 1000,
+    conversationSignalMaxCandidates: 120,
+    conversationLocationHintTtlMs: 10 * 60 * 1000,
+    conversationLocationHintMaxEntries: 240,
     attachmentValidationMaxAttempts: 4,
     attachmentValidationBaseDelayMs: 1200,
-    attachmentValidationFetchLimit: 30
+    attachmentValidationFetchLimit: 30,
+    sendItemMaxAttempts: 3,
+    sendItemRetryDelayMs: 900,
+    sendRecoveryWindowMs: 4 * 60 * 1000
   };
 
   // Armazenar arquivos selecionados
@@ -1184,6 +1192,9 @@
   let pendingObservedEntriesTimer = null;
   const conversationContextCache = new Map();
   const conversationContextInflight = new Map();
+  const conversationLocationHints = new Map();
+  const conversationCandidateSignals = new Map();
+  const sendRecoveryStateByConversation = new Map();
   let conversationIntentTrackingInitialized = false;
   const conversationIntentState = {
     active: false,
@@ -1191,6 +1202,7 @@
     hintConversationId: null,
     source: null
   };
+  const CONVERSATION_INTENT_KEYS = new Set(['Enter', ' ', 'Spacebar', 'ArrowUp', 'ArrowDown']);
 
   function normalizeConversationId(value) {
     if (value === undefined || value === null) return null;
@@ -1200,6 +1212,18 @@
 
   function isLikelyConversationId(value) {
     const normalized = normalizeConversationId(value);
+    if (!normalized) return false;
+    return /^[A-Za-z0-9_-]{10,}$/.test(normalized);
+  }
+
+  function normalizeLocationId(value) {
+    if (value === undefined || value === null) return null;
+    const normalized = String(value).trim();
+    return normalized || null;
+  }
+
+  function isLikelyLocationId(value) {
+    const normalized = normalizeLocationId(value);
     if (!normalized) return false;
     return /^[A-Za-z0-9_-]{10,}$/.test(normalized);
   }
@@ -1306,18 +1330,169 @@
     return null;
   }
 
+  function getConversationSignalChannel(source = '') {
+    if (!source) return 'unknown';
+    if (source.includes('conversation-context')) return 'context';
+    if (source.includes(':conversation') || source.includes('conversation-detail')) return 'conversation';
+    if (source.includes(':messages') || source.includes('conversation-messages')) return 'messages';
+    if (source.includes('message-search')) return 'message-search';
+    if (source.includes('employee-configs')) return 'employee-configs';
+    if (source.includes('network:url')) return 'url';
+    return 'other';
+  }
+
+  function isAuthoritativeConversationSource(source = '') {
+    if (!source) return false;
+    return source.includes(':conversation') || source.includes('conversation-detail') || source.includes('conversation-context');
+  }
+
   function isHighConfidenceConversationSource(source = '') {
     if (!source) return false;
     return (
-      source.includes(':conversation') ||
+      isAuthoritativeConversationSource(source) ||
       source.includes(':messages') ||
-      source.includes('message-search')
+      source.includes('conversation-messages') ||
+      source.includes('message-search') ||
+      source.includes('employee-configs')
+    );
+  }
+
+  function pruneConversationCandidateSignals(now = Date.now()) {
+    for (const [conversationId, record] of conversationCandidateSignals.entries()) {
+      if (!record || now - record.lastSeenAt > CONFIG.conversationSignalWindowMs) {
+        conversationCandidateSignals.delete(conversationId);
+      }
+    }
+
+    if (conversationCandidateSignals.size <= CONFIG.conversationSignalMaxCandidates) return;
+
+    const records = Array.from(conversationCandidateSignals.entries())
+      .sort((a, b) => (a[1]?.lastSeenAt || 0) - (b[1]?.lastSeenAt || 0));
+
+    while (records.length > CONFIG.conversationSignalMaxCandidates) {
+      const [oldestConversationId] = records.shift();
+      conversationCandidateSignals.delete(oldestConversationId);
+    }
+  }
+
+  function getConversationSignalRecord(candidateConversationId, source = 'network') {
+    const conversationId = normalizeConversationId(candidateConversationId);
+    if (!conversationId) return null;
+    if (source.includes('search-v2')) return null;
+
+    const now = Date.now();
+    pruneConversationCandidateSignals(now);
+
+    let record = conversationCandidateSignals.get(conversationId);
+    if (!record) {
+      record = {
+        firstSeenAt: now,
+        lastSeenAt: now,
+        highConfidenceSignalCount: 0,
+        channels: new Set(),
+        highConfidenceChannels: new Set()
+      };
+      conversationCandidateSignals.set(conversationId, record);
+    }
+
+    record.lastSeenAt = now;
+    const channel = getConversationSignalChannel(source);
+    record.channels.add(channel);
+
+    if (isHighConfidenceConversationSource(source)) {
+      record.highConfidenceSignalCount += 1;
+      record.highConfidenceChannels.add(channel);
+    }
+
+    return record;
+  }
+
+  function hasConversationNetworkConsensus(candidateConversationId, source = 'network') {
+    const record = getConversationSignalRecord(candidateConversationId, source);
+    if (!record) return false;
+
+    if (record.highConfidenceChannels.size >= 2) return true;
+    if (record.highConfidenceSignalCount >= 2) return true;
+
+    return record.highConfidenceChannels.size >= 1 && record.channels.size >= 2;
+  }
+
+  function clearConversationSignal(candidateConversationId) {
+    const conversationId = normalizeConversationId(candidateConversationId);
+    if (!conversationId) return;
+    conversationCandidateSignals.delete(conversationId);
+  }
+
+  function pruneConversationLocationHints(now = Date.now()) {
+    for (const [conversationId, record] of conversationLocationHints.entries()) {
+      if (!record || record.expiresAt <= now) {
+        conversationLocationHints.delete(conversationId);
+      }
+    }
+
+    if (conversationLocationHints.size <= CONFIG.conversationLocationHintMaxEntries) return;
+
+    const records = Array.from(conversationLocationHints.entries())
+      .sort((a, b) => (a[1]?.updatedAt || 0) - (b[1]?.updatedAt || 0));
+
+    while (records.length > CONFIG.conversationLocationHintMaxEntries) {
+      const [oldestConversationId] = records.shift();
+      conversationLocationHints.delete(oldestConversationId);
+    }
+  }
+
+  function rememberConversationLocationHint(conversationId, locationId, source = 'network') {
+    const normalizedConversationId = normalizeConversationId(conversationId);
+    const normalizedLocationId = normalizeLocationId(locationId);
+    if (!normalizedConversationId || !normalizedLocationId) return;
+    if (!isLikelyConversationId(normalizedConversationId) || !isLikelyLocationId(normalizedLocationId)) return;
+
+    const now = Date.now();
+    pruneConversationLocationHints(now);
+
+    const existing = conversationLocationHints.get(normalizedConversationId);
+    if (existing && existing.locationId === normalizedLocationId) {
+      existing.updatedAt = now;
+      existing.expiresAt = now + CONFIG.conversationLocationHintTtlMs;
+      return;
+    }
+
+    conversationLocationHints.set(normalizedConversationId, {
+      locationId: normalizedLocationId,
+      source,
+      updatedAt: now,
+      expiresAt: now + CONFIG.conversationLocationHintTtlMs
+    });
+  }
+
+  function getConversationLocationHint(conversationId) {
+    const normalizedConversationId = normalizeConversationId(conversationId);
+    if (!normalizedConversationId) return null;
+
+    const now = Date.now();
+    pruneConversationLocationHints(now);
+
+    const record = conversationLocationHints.get(normalizedConversationId);
+    return record ? record.locationId : null;
+  }
+
+  function isHighConfidenceLocationSource(source = '') {
+    if (!source) return false;
+
+    return (
+      source.includes('conversation-context') ||
+      source.includes(':conversation') ||
+      source.includes('conversation-detail') ||
+      source.includes(':messages') ||
+      source.includes('conversation-messages') ||
+      source.includes('message-search') ||
+      source.includes('employee-configs')
     );
   }
 
   function shouldAcceptConversationIdCandidate(candidateConversationId, source = 'network') {
     const candidate = normalizeConversationId(candidateConversationId);
-    if (!candidate) return false;
+    if (!candidate || !isLikelyConversationId(candidate)) return false;
 
     if (candidate === conversationResolverState.conversationId) return true;
 
@@ -1335,30 +1510,99 @@
       return isHighConfidenceConversationSource(source);
     }
 
+    if (source.includes('search-v2')) return false;
+    if (isAuthoritativeConversationSource(source)) {
+      if (!conversationResolverState.conversationId) return true;
+      return hasConversationNetworkConsensus(candidate, source);
+    }
+
     if (conversationResolverState.conversationId) {
+      return hasConversationNetworkConsensus(candidate, source);
+    }
+
+    if (isHighConfidenceConversationSource(source)) return true;
+    return hasConversationNetworkConsensus(candidate, source);
+  }
+
+  function shouldAcceptLocationIdCandidate(candidateLocationId, source = 'network', candidateConversationId = null) {
+    const candidate = normalizeLocationId(candidateLocationId);
+    if (!candidate || !isLikelyLocationId(candidate)) return false;
+
+    if (candidate === conversationResolverState.locationId) return true;
+
+    const sourceIsHighConfidence = isHighConfidenceLocationSource(source);
+    const sourceIsLowConfidence = source.includes('search-v2') || source.includes('conversation-generic');
+    const normalizedConversationId = normalizeConversationId(candidateConversationId);
+    const activeConversationId = conversationResolverState.conversationId;
+    const scopedConversationId = normalizedConversationId || activeConversationId;
+
+    if (scopedConversationId) {
+      const hintedLocationId = getConversationLocationHint(scopedConversationId);
+      if (hintedLocationId && hintedLocationId !== candidate) {
+        if (!sourceIsHighConfidence) {
+          return false;
+        }
+      }
+    }
+
+    if (activeConversationId && normalizedConversationId && normalizedConversationId !== activeConversationId) {
+      if (!sourceIsHighConfidence && !isConversationIntentActive()) {
+        return false;
+      }
+    }
+
+    if (activeConversationId && !normalizedConversationId) {
+      const activeHint = getConversationLocationHint(activeConversationId);
+      if (activeHint && activeHint !== candidate) {
+        return sourceIsHighConfidence;
+      }
+
+      if (conversationResolverState.locationId && conversationResolverState.locationId !== candidate) {
+        if (sourceIsLowConfidence) return false;
+        return sourceIsHighConfidence;
+      }
+    }
+
+    if (sourceIsLowConfidence && conversationResolverState.locationId && conversationResolverState.locationId !== candidate) {
       return false;
     }
 
-    if (source.includes('search-v2')) return false;
-    return isHighConfidenceConversationSource(source);
+    if (!conversationResolverState.locationId) {
+      return sourceIsHighConfidence || !activeConversationId;
+    }
+
+    return sourceIsHighConfidence;
   }
 
   function initConversationIntentTracking() {
     if (conversationIntentTrackingInitialized) return;
     conversationIntentTrackingInitialized = true;
 
-    document.addEventListener('click', (event) => {
-      const target = event.target;
+    const armIntentFromTarget = (target, source) => {
       if (!isConversationListClick(target)) return;
-
       const hintedConversationId = resolveConversationIdFromElement(target);
-      armConversationIntent(hintedConversationId, 'user-list-click');
+      armConversationIntent(hintedConversationId, source);
+    };
+
+    document.addEventListener('click', (event) => {
+      armIntentFromTarget(event.target, 'user-list-click');
+    }, true);
+
+    document.addEventListener('focusin', (event) => {
+      armIntentFromTarget(event.target, 'user-list-focus');
+    }, true);
+
+    document.addEventListener('keydown', (event) => {
+      if (!CONVERSATION_INTENT_KEYS.has(event.key)) return;
+      const target = event.target instanceof Element ? event.target : document.activeElement;
+      armIntentFromTarget(target, 'user-list-keyboard');
     }, true);
   }
 
   function resetConversationResolverForNavigation(source = 'network:navigation') {
     const keysToReset = [
       'conversationId',
+      'locationId',
       'contactId',
       'conversationType',
       'conversationProviderId',
@@ -1383,6 +1627,7 @@
     }
 
     clearConversationIntent('navigation');
+    conversationCandidateSignals.clear();
   }
 
   function mergeResolverState(partialState, source = 'network') {
@@ -1425,6 +1670,26 @@
       }
     }
 
+    const candidateLocationId = normalizeLocationId(sanitizedState.locationId);
+    if (candidateLocationId) {
+      const conversationScopeForLocation =
+        sanitizedState.conversationId ||
+        conversationResolverState.conversationId ||
+        null;
+      const shouldAcceptLocation = shouldAcceptLocationIdCandidate(
+        candidateLocationId,
+        source,
+        conversationScopeForLocation
+      );
+
+      if (!shouldAcceptLocation) {
+        log(`[Context Resolver] LocationId ignorado (${candidateLocationId}) via ${source}`);
+        sanitizedState.locationId = null;
+      } else {
+        sanitizedState.locationId = candidateLocationId;
+      }
+    }
+
     let changed = false;
 
     // Quando a conversa muda, limpa campos acoplados à conversa anterior
@@ -1445,6 +1710,21 @@
           changed = true;
         }
       }
+
+      const hasIncomingLocationId =
+        sanitizedState.locationId !== undefined &&
+        sanitizedState.locationId !== null &&
+        sanitizedState.locationId !== '';
+
+      if (!hasIncomingLocationId) {
+        const hintedLocationId = getConversationLocationHint(sanitizedState.conversationId);
+        if (hintedLocationId) {
+          sanitizedState.locationId = hintedLocationId;
+        } else if (conversationResolverState.locationId !== null) {
+          conversationResolverState.locationId = null;
+          changed = true;
+        }
+      }
     }
 
     for (const key of allowedKeys) {
@@ -1453,6 +1733,21 @@
         conversationResolverState[key] = sanitizedState[key];
         changed = true;
       }
+    }
+
+    if (conversationResolverState.conversationId && conversationResolverState.locationId) {
+      rememberConversationLocationHint(
+        conversationResolverState.conversationId,
+        conversationResolverState.locationId,
+        source
+      );
+    }
+
+    if (
+      sanitizedState.conversationId &&
+      conversationResolverState.conversationId === sanitizedState.conversationId
+    ) {
+      clearConversationSignal(sanitizedState.conversationId);
     }
 
     if (changed) {
@@ -1568,6 +1863,42 @@
     }
   }
 
+  function classifyConversationEndpoint(urlString) {
+    try {
+      const url = new URL(urlString, window.location.origin);
+      const pathname = url.pathname || '';
+
+      if (pathname.includes('/conversations-ai/employeeConfigs') || pathname.includes('/employeeConfigs')) {
+        return 'employee-configs';
+      }
+
+      if (pathname.includes('/conversations/messages/search')) {
+        return 'message-search';
+      }
+
+      if (pathname.includes('/conversations/search/v2')) {
+        return 'search-v2';
+      }
+
+      if (/\/conversations\/[^\/?#]+\/messages/i.test(pathname)) {
+        return 'conversation-messages';
+      }
+
+      const detailMatch = pathname.match(/\/conversations\/([^\/?#]+)$/i);
+      if (detailMatch && detailMatch[1]) {
+        const candidate = String(detailMatch[1]).toLowerCase();
+        const reserved = new Set(['messages', 'search', 'filters', 'providers', 'sla-settings', 'upload']);
+        if (!reserved.has(candidate)) {
+          return 'conversation-detail';
+        }
+      }
+
+      return 'conversation-generic';
+    } catch (error) {
+      return 'conversation-unknown';
+    }
+  }
+
   function isConversationSearchResource(entry) {
     if (!entry || !entry.name) return false;
     if (entry.initiatorType !== 'fetch' && entry.initiatorType !== 'xmlhttprequest') return false;
@@ -1623,6 +1954,7 @@
 
   function processContextFromUrl(urlString, source = 'network:url') {
     if (!urlString) return;
+    const endpointTag = classifyConversationEndpoint(urlString);
 
     const partial = {
       conversationId: parseConversationIdFromUrl(urlString),
@@ -1642,7 +1974,7 @@
       // no-op
     }
 
-    mergeResolverState(partial, source);
+    mergeResolverState(partial, `${source}:${endpointTag}`);
   }
 
   function inspectNetworkPayload(urlString, payload, source = 'network:response') {
@@ -1745,7 +2077,7 @@
       conversationId: parsedBody.conversationId || parsedBody.conversation_id || null,
       locationId: parsedBody.locationId || parsedBody.location_id || null,
       contactId: parsedBody.contactId || parsedBody.contact_id || null
-    }, `network:request:${method}`);
+    }, `network:request:${method}:${classifyConversationEndpoint(urlString)}`);
   }
 
   function processResourceEntry(entry, source = 'network:resource') {
@@ -1912,7 +2244,26 @@
     return { ...conversationResolverState };
   }
 
+  function pruneConversationContextCache(now = Date.now()) {
+    for (const [conversationId, cachedEntry] of conversationContextCache.entries()) {
+      if (!cachedEntry || cachedEntry.expiresAt <= now) {
+        conversationContextCache.delete(conversationId);
+      }
+    }
+
+    if (conversationContextCache.size <= CONFIG.conversationContextCacheMaxEntries) return;
+
+    const entriesByExpiry = Array.from(conversationContextCache.entries())
+      .sort((a, b) => (a[1]?.expiresAt || 0) - (b[1]?.expiresAt || 0));
+
+    while (entriesByExpiry.length > CONFIG.conversationContextCacheMaxEntries) {
+      const [oldestConversationId] = entriesByExpiry.shift();
+      conversationContextCache.delete(oldestConversationId);
+    }
+  }
+
   function getCachedConversationContext(conversationId) {
+    pruneConversationContextCache();
     const cachedEntry = conversationContextCache.get(conversationId);
     if (!cachedEntry) return null;
 
@@ -1925,6 +2276,7 @@
   }
 
   function setCachedConversationContext(conversationId, context) {
+    pruneConversationContextCache();
     conversationContextCache.set(conversationId, {
       value: { ...context },
       expiresAt: Date.now() + CONFIG.conversationContextTtlMs
@@ -2312,61 +2664,135 @@
   // 15. ENVIAR MENSAGEM COM ANEXOS
   // ============================================
 
-  async function sendMessageWithAttachments(attachmentUrls, messageText, conversationContext) {
+  function normalizeMessageTextForComparison(value) {
+    if (!value || typeof value !== 'string') return '';
+    return value.replace(/\s+/g, ' ').trim();
+  }
+
+  function stableHash(value) {
+    const text = String(value || '');
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      hash = ((hash << 5) - hash) + text.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(36);
+  }
+
+  function buildSendOperationFingerprint(messageText, attachmentUrls) {
+    const normalizedText = normalizeMessageTextForComparison(messageText);
+    const normalizedAttachmentUrls = (Array.isArray(attachmentUrls) ? attachmentUrls : [])
+      .map(url => normalizeAttachmentUrl(url) || String(url || '').trim().toLowerCase())
+      .filter(Boolean);
+
+    return stableHash(JSON.stringify({
+      text: normalizedText,
+      attachments: normalizedAttachmentUrls
+    }));
+  }
+
+  function pruneSendRecoveryStates(now = Date.now()) {
+    for (const [conversationId, state] of sendRecoveryStateByConversation.entries()) {
+      if (!state || now - state.updatedAt > CONFIG.sendRecoveryWindowMs) {
+        sendRecoveryStateByConversation.delete(conversationId);
+      }
+    }
+  }
+
+  function getOrCreateSendRecoveryState(conversationId, operationFingerprint) {
+    if (!conversationId) return null;
+
+    pruneSendRecoveryStates();
+
+    const existing = sendRecoveryStateByConversation.get(conversationId);
+    const now = Date.now();
+
+    if (existing) {
+      const isSameOperation = existing.operationFingerprint === operationFingerprint;
+      const isFresh = now - existing.updatedAt <= CONFIG.sendRecoveryWindowMs;
+      if (isSameOperation && isFresh) {
+        return existing;
+      }
+    }
+
+    const next = {
+      operationFingerprint,
+      completedItemKeys: new Set(),
+      failedAt: 0,
+      createdAt: now,
+      updatedAt: now
+    };
+    sendRecoveryStateByConversation.set(conversationId, next);
+    return next;
+  }
+
+  function markRecoveryItemCompleted(recoveryState, itemKey) {
+    if (!recoveryState || !itemKey) return;
+    recoveryState.completedItemKeys.add(itemKey);
+    recoveryState.updatedAt = Date.now();
+  }
+
+  function clearSendRecoveryState(conversationId) {
+    if (!conversationId) return;
+    sendRecoveryStateByConversation.delete(conversationId);
+  }
+
+  function extractMessageTextCandidates(message) {
+    if (!message || typeof message !== 'object') return [];
+
+    const candidates = [];
+    const keys = ['message', 'body', 'text', 'content', 'comment', 'note'];
+    for (const key of keys) {
+      if (typeof message[key] === 'string' && message[key].trim()) {
+        candidates.push(normalizeMessageTextForComparison(message[key]));
+      }
+    }
+
+    return Array.from(new Set(candidates));
+  }
+
+  function isTextDeliveredInMessages(messages, expectedText) {
+    const normalizedExpectedText = normalizeMessageTextForComparison(expectedText);
+    if (!normalizedExpectedText) return true;
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+
+    return messages.some(message => {
+      const candidates = extractMessageTextCandidates(message);
+      return candidates.includes(normalizedExpectedText);
+    });
+  }
+
+  async function wasSendItemDelivered(conversationId, item, options = {}) {
+    if (!conversationId || !item) return false;
+    const notBeforeMs = Number(options.notBeforeMs || 0);
+
     try {
-      log('Enviando mensagens com anexos...');
+      const recentMessages = await fetchRecentMessages(conversationId, CONFIG.attachmentValidationFetchLimit);
+      if (!Array.isArray(recentMessages) || recentMessages.length === 0) return false;
 
-      const results = [];
-      const basePayload = {
-        type: conversationContext.messageType,
-        contactId: conversationContext.contactId,
-        status: 'pending'
-      };
+      const scopedMessages = filterMessagesByTimestamp(recentMessages, notBeforeMs);
 
-      if (conversationContext.conversationProviderId) {
-        basePayload.conversationProviderId = conversationContext.conversationProviderId;
+      if (item.type === 'attachment') {
+        const evaluation = evaluateAttachmentDelivery(scopedMessages, [item.attachmentUrl], { notBeforeMs });
+        return evaluation.missingUrls.length === 0;
       }
 
-      // Se houver texto, enviar a mensagem de texto primeiro
-      if (messageText) {
-        log('Enviando mensagem de texto...');
-        const textPayload = {
-          ...basePayload,
-          message: messageText,
-        };
-
-        const textResponse = await fetch(CONFIG.sendEndpoint, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${CONFIG.apiKey}`,
-            'Content-Type': 'application/json',
-            'Version': CONFIG.apiVersion
-          },
-          body: JSON.stringify(textPayload)
-        });
-
-        if (!textResponse.ok) {
-          const errorText = await textResponse.text();
-          throw new Error(`Erro ao enviar mensagem de texto: ${textResponse.status} - ${errorText}`);
-        }
-
-        const textResult = await textResponse.json();
-        log('Mensagem de texto enviada:', textResult);
-        results.push(textResult);
+      if (item.type === 'text') {
+        return isTextDeliveredInMessages(scopedMessages, item.text);
       }
+    } catch (error) {
+      log('[Send Recovery] Falha ao verificar entrega prévia do item:', error);
+    }
 
-      // Enviar cada foto como uma mensagem separada
-      for (let i = 0; i < attachmentUrls.length; i++) {
-        const url = attachmentUrls[i];
-        log(`Enviando foto ${i + 1}/${attachmentUrls.length}: ${url}`);
+    return false;
+  }
 
-        const payload = {
-          ...basePayload,
-          attachments: [url],  // Array com apenas uma URL (string)
-        };
+  async function sendMessageItem(payload, item, recoveryState, conversationId) {
+    let lastError = null;
+    const recoveryNotBeforeMs = recoveryState ? recoveryState.createdAt - 15000 : 0;
 
-        log('Payload da mensagem:', payload);
-
+    for (let attempt = 1; attempt <= CONFIG.sendItemMaxAttempts; attempt++) {
+      try {
         const response = await fetch(CONFIG.sendEndpoint, {
           method: 'POST',
           headers: {
@@ -2379,18 +2805,131 @@
 
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`Erro ao enviar foto ${i + 1}: ${response.status} - ${errorText}`);
+          throw new Error(`Erro ao enviar ${item.label}: ${response.status} - ${errorText}`);
         }
 
-        const result = await response.json();
-        log(`Foto ${i + 1} enviada com sucesso:`, result);
-        results.push(result);
+        const result = await response.json().catch(() => ({}));
+        markRecoveryItemCompleted(recoveryState, item.key);
+        return result;
+      } catch (error) {
+        lastError = error;
+        log(`[Send Retry] ${item.label} falhou na tentativa ${attempt}/${CONFIG.sendItemMaxAttempts}:`, error);
+
+        const deliveredAfterFailure = await wasSendItemDelivered(conversationId, item, {
+          notBeforeMs: recoveryNotBeforeMs
+        });
+        if (deliveredAfterFailure) {
+          log(`[Send Recovery] ${item.label} já estava entregue após falha de rede.`);
+          markRecoveryItemCompleted(recoveryState, item.key);
+          return null;
+        }
+
+        if (attempt < CONFIG.sendItemMaxAttempts) {
+          await delay(CONFIG.sendItemRetryDelayMs * attempt);
+        }
+      }
+    }
+
+    throw lastError || new Error(`Falha ao enviar ${item.label}`);
+  }
+
+  async function sendMessageWithAttachments(attachmentUrls, messageText, conversationContext) {
+    const conversationId = conversationContext?.conversationId || null;
+    const operationFingerprint = buildSendOperationFingerprint(messageText, attachmentUrls);
+    const recoveryState = getOrCreateSendRecoveryState(conversationId, operationFingerprint);
+
+    try {
+      log('Enviando mensagens com anexos...');
+
+      if (!conversationId) {
+        throw new Error('ConversationId ausente no contexto de envio.');
       }
 
+      const results = [];
+      const basePayload = {
+        type: conversationContext.messageType,
+        contactId: conversationContext.contactId,
+        status: 'pending'
+      };
+
+      if (conversationContext.conversationProviderId) {
+        basePayload.conversationProviderId = conversationContext.conversationProviderId;
+      }
+
+      const queue = [];
+      const normalizedText = normalizeMessageTextForComparison(messageText);
+      if (normalizedText) {
+        queue.push({
+          key: `text:${stableHash(normalizedText)}`,
+          label: 'mensagem de texto',
+          type: 'text',
+          text: normalizedText,
+          payload: {
+            ...basePayload,
+            message: normalizedText
+          }
+        });
+      }
+
+      const safeAttachmentUrls = Array.isArray(attachmentUrls) ? attachmentUrls : [];
+      for (let i = 0; i < safeAttachmentUrls.length; i++) {
+        const rawUrl = safeAttachmentUrls[i];
+        if (!rawUrl || typeof rawUrl !== 'string') continue;
+
+        const normalizedUrl = normalizeAttachmentUrl(rawUrl) || rawUrl.trim().toLowerCase();
+        if (!normalizedUrl) continue;
+
+        queue.push({
+          key: `attachment:${stableHash(normalizedUrl)}`,
+          label: `anexo ${i + 1}/${safeAttachmentUrls.length}`,
+          type: 'attachment',
+          attachmentUrl: rawUrl,
+          payload: {
+            ...basePayload,
+            attachments: [rawUrl]
+          }
+        });
+      }
+
+      const isRecoveryMode = Boolean(
+        recoveryState &&
+        recoveryState.failedAt &&
+        Date.now() - recoveryState.failedAt <= CONFIG.sendRecoveryWindowMs
+      );
+      const recoveryNotBeforeMs = recoveryState ? recoveryState.createdAt - 15000 : 0;
+
+      for (const item of queue) {
+        if (recoveryState && recoveryState.completedItemKeys.has(item.key)) {
+          log(`[Send Recovery] Pulando ${item.label} (já concluído anteriormente).`);
+          continue;
+        }
+
+        if (isRecoveryMode) {
+          const alreadyDelivered = await wasSendItemDelivered(conversationId, item, {
+            notBeforeMs: recoveryNotBeforeMs
+          });
+          if (alreadyDelivered) {
+            log(`[Send Recovery] ${item.label} já estava entregue, marcado como concluído.`);
+            markRecoveryItemCompleted(recoveryState, item.key);
+            continue;
+          }
+        }
+
+        const itemResult = await sendMessageItem(item.payload, item, recoveryState, conversationId);
+        if (itemResult) {
+          results.push(itemResult);
+        }
+      }
+
+      clearSendRecoveryState(conversationId);
       log('Todas as mensagens foram enviadas:', results);
       return results;
-
     } catch (error) {
+      if (recoveryState) {
+        recoveryState.failedAt = Date.now();
+        recoveryState.updatedAt = Date.now();
+      }
+
       log('ERRO ao enviar mensagens:', error);
       throw error;
     }
@@ -2506,70 +3045,227 @@
     return [];
   }
 
-  function evaluateAttachmentDelivery(messages, expectedAttachmentUrls) {
+  function buildAttachmentDescriptor(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string' || !rawUrl.trim()) return null;
+
+    const normalizedUrl = normalizeAttachmentUrl(rawUrl);
+    const fileName = extractFileNameFromUrl(rawUrl);
+    const fileStem = fileName ? fileName.replace(/\.[a-z0-9]{1,8}$/i, '') : null;
+    let pathTail = null;
+
+    try {
+      const parsed = new URL(rawUrl, window.location.origin);
+      const segments = parsed.pathname
+        .split('/')
+        .filter(Boolean)
+        .map(segment => decodeURIComponent(segment).toLowerCase());
+      if (segments.length > 0) {
+        pathTail = segments.slice(-2).join('/');
+      }
+    } catch (error) {
+      const fallbackSegments = String(rawUrl)
+        .split('#')[0]
+        .split('?')[0]
+        .split('/')
+        .filter(Boolean)
+        .map(segment => segment.toLowerCase());
+      if (fallbackSegments.length > 0) {
+        pathTail = fallbackSegments.slice(-2).join('/');
+      }
+    }
+
+    return {
+      rawUrl,
+      normalizedUrl,
+      fileName,
+      fileStem,
+      pathTail
+    };
+  }
+
+  function extractMessageTimestampMs(message) {
+    if (!message || typeof message !== 'object') return null;
+
+    const candidateValues = [
+      message.dateAdded,
+      message.createdAt,
+      message.updatedAt,
+      message.dateUpdated,
+      message.timestamp,
+      message.messageTime,
+      message.time
+    ];
+
+    for (const value of candidateValues) {
+      if (value === undefined || value === null) continue;
+
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        if (value > 1e12) return value;
+        if (value > 1e9) return value * 1000;
+      }
+
+      if (typeof value === 'string') {
+        const parsed = Date.parse(value);
+        if (!Number.isNaN(parsed)) return parsed;
+      }
+    }
+
+    return null;
+  }
+
+  function filterMessagesByTimestamp(messages, notBeforeMs = 0) {
+    if (!Array.isArray(messages) || messages.length === 0) return [];
+    if (!Number.isFinite(notBeforeMs) || notBeforeMs <= 0) return messages;
+
+    const filtered = messages.filter(message => {
+      const timestampMs = extractMessageTimestampMs(message);
+      return !timestampMs || timestampMs >= notBeforeMs;
+    });
+
+    return filtered.length > 0 ? filtered : messages;
+  }
+
+  function findBestAttachmentMatch(expectedDescriptor, observedDescriptors, consumedObservedIndexes) {
+    if (!expectedDescriptor) return null;
+
+    for (let i = 0; i < observedDescriptors.length; i++) {
+      if (consumedObservedIndexes.has(i)) continue;
+      if (
+        expectedDescriptor.normalizedUrl &&
+        observedDescriptors[i].normalizedUrl &&
+        observedDescriptors[i].normalizedUrl === expectedDescriptor.normalizedUrl
+      ) {
+        return { index: i, matchType: 'url' };
+      }
+    }
+
+    const pathMatches = [];
+    if (expectedDescriptor.pathTail) {
+      for (let i = 0; i < observedDescriptors.length; i++) {
+        if (consumedObservedIndexes.has(i)) continue;
+        if (observedDescriptors[i].pathTail && observedDescriptors[i].pathTail === expectedDescriptor.pathTail) {
+          pathMatches.push(i);
+        }
+      }
+      if (pathMatches.length === 1) {
+        return { index: pathMatches[0], matchType: 'path-tail' };
+      }
+    }
+
+    const fileNameMatches = [];
+    if (expectedDescriptor.fileName) {
+      for (let i = 0; i < observedDescriptors.length; i++) {
+        if (consumedObservedIndexes.has(i)) continue;
+        if (observedDescriptors[i].fileName && observedDescriptors[i].fileName === expectedDescriptor.fileName) {
+          fileNameMatches.push(i);
+        }
+      }
+      if (fileNameMatches.length === 1) {
+        return { index: fileNameMatches[0], matchType: 'file-name' };
+      }
+    }
+
+    const fileStemMatches = [];
+    if (expectedDescriptor.fileStem && expectedDescriptor.fileStem.length >= 10) {
+      for (let i = 0; i < observedDescriptors.length; i++) {
+        if (consumedObservedIndexes.has(i)) continue;
+        if (observedDescriptors[i].fileStem && observedDescriptors[i].fileStem === expectedDescriptor.fileStem) {
+          fileStemMatches.push(i);
+        }
+      }
+      if (fileStemMatches.length === 1) {
+        return { index: fileStemMatches[0], matchType: 'file-stem' };
+      }
+    }
+
+    return null;
+  }
+
+  function evaluateAttachmentDelivery(messages, expectedAttachmentUrls, options = {}) {
     const expectedDescriptors = expectedAttachmentUrls
       .filter(url => typeof url === 'string' && url.trim())
-      .map(rawUrl => ({
-        rawUrl,
-        normalizedUrl: normalizeAttachmentUrl(rawUrl)
-      }));
+      .map(rawUrl => buildAttachmentDescriptor(rawUrl))
+      .filter(Boolean);
 
-    const observedNormalizedUrls = new Set();
+    const candidateMessages = filterMessagesByTimestamp(messages, Number(options.notBeforeMs || 0));
 
-    messages.forEach(message => {
+    const observedDescriptors = [];
+    candidateMessages.forEach(message => {
       const messageAttachmentUrls = extractAttachmentUrlsFromMessage(message);
       messageAttachmentUrls.forEach(url => {
-        const normalized = normalizeAttachmentUrl(url);
-        if (normalized) {
-          observedNormalizedUrls.add(normalized);
+        const descriptor = buildAttachmentDescriptor(url);
+        if (descriptor) {
+          observedDescriptors.push(descriptor);
         }
       });
     });
 
+    const consumedObservedIndexes = new Set();
     const deliveredUrls = [];
+    const deliveredByUrl = [];
+    const deliveredBySignature = [];
     const missingUrls = [];
 
-    expectedDescriptors.forEach(descriptor => {
-      const deliveredByUrl = descriptor.normalizedUrl && observedNormalizedUrls.has(descriptor.normalizedUrl);
+    expectedDescriptors.forEach(expectedDescriptor => {
+      const match = findBestAttachmentMatch(expectedDescriptor, observedDescriptors, consumedObservedIndexes);
+      if (match) {
+        consumedObservedIndexes.add(match.index);
+        deliveredUrls.push(expectedDescriptor.rawUrl);
 
-      if (deliveredByUrl) {
-        deliveredUrls.push(descriptor.rawUrl);
+        if (match.matchType === 'url') {
+          deliveredByUrl.push(expectedDescriptor.rawUrl);
+        } else {
+          deliveredBySignature.push(expectedDescriptor.rawUrl);
+        }
       } else {
-        missingUrls.push(descriptor.rawUrl);
+        missingUrls.push(expectedDescriptor.rawUrl);
       }
     });
 
-    return { deliveredUrls, missingUrls };
+    return {
+      deliveredUrls,
+      missingUrls,
+      deliveredByUrl,
+      deliveredBySignature,
+      inspectedMessages: candidateMessages.length
+    };
   }
 
-  async function validateAttachmentDelivery(conversationId, expectedAttachmentUrls) {
+  async function validateAttachmentDelivery(conversationId, expectedAttachmentUrls, options = {}) {
     const expectedUrls = Array.isArray(expectedAttachmentUrls)
       ? expectedAttachmentUrls.filter(url => typeof url === 'string' && url.trim())
       : [];
+    const notBeforeMs = Number(options.notBeforeMs || 0);
 
     if (expectedUrls.length === 0) {
       return {
         ok: true,
         attempts: 0,
         deliveredUrls: [],
-        missingUrls: []
+        missingUrls: [],
+        deliveredByUrl: [],
+        deliveredBySignature: []
       };
     }
 
     let lastEvaluation = {
       deliveredUrls: [],
-      missingUrls: expectedUrls.slice()
+      missingUrls: expectedUrls.slice(),
+      deliveredByUrl: [],
+      deliveredBySignature: []
     };
     let lastError = null;
 
     for (let attempt = 1; attempt <= CONFIG.attachmentValidationMaxAttempts; attempt++) {
       try {
         const messages = await fetchRecentMessages(conversationId, CONFIG.attachmentValidationFetchLimit);
-        lastEvaluation = evaluateAttachmentDelivery(messages, expectedUrls);
+        lastEvaluation = evaluateAttachmentDelivery(messages, expectedUrls, { notBeforeMs });
 
         log(
           `[Validação de anexos] Tentativa ${attempt}/${CONFIG.attachmentValidationMaxAttempts}: ` +
-          `${lastEvaluation.deliveredUrls.length}/${expectedUrls.length} confirmado(s)`
+          `${lastEvaluation.deliveredUrls.length}/${expectedUrls.length} confirmado(s) ` +
+          `(${lastEvaluation.deliveredByUrl.length} por URL, ` +
+          `${lastEvaluation.deliveredBySignature.length} por assinatura)`
         );
 
         if (lastEvaluation.missingUrls.length === 0) {
@@ -2577,7 +3273,9 @@
             ok: true,
             attempts: attempt,
             deliveredUrls: lastEvaluation.deliveredUrls,
-            missingUrls: []
+            missingUrls: [],
+            deliveredByUrl: lastEvaluation.deliveredByUrl,
+            deliveredBySignature: lastEvaluation.deliveredBySignature
           };
         }
       } catch (error) {
@@ -2595,6 +3293,8 @@
       attempts: CONFIG.attachmentValidationMaxAttempts,
       deliveredUrls: lastEvaluation.deliveredUrls,
       missingUrls: lastEvaluation.missingUrls,
+      deliveredByUrl: lastEvaluation.deliveredByUrl,
+      deliveredBySignature: lastEvaluation.deliveredBySignature,
       error: lastError ? lastError.message : null
     };
   }
@@ -3407,10 +4107,13 @@
         log('Upload de imagens/áudios concluído:', nonVideoUrls);
 
         sendBtn.innerHTML = 'Enviando mensagens...';
+        const sendStartedAt = Date.now();
         await sendMessageWithAttachments(nonVideoUrls, messageText, conversationContext);
 
         sendBtn.innerHTML = 'Validando envio das mídias...';
-        const deliveryValidation = await validateAttachmentDelivery(conversationId, nonVideoUrls);
+        const deliveryValidation = await validateAttachmentDelivery(conversationId, nonVideoUrls, {
+          notBeforeMs: sendStartedAt - 15000
+        });
         if (!deliveryValidation.ok) {
           log('Falha na validação de entrega das mídias:', deliveryValidation);
           throw new Error(
