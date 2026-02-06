@@ -28,6 +28,7 @@
     videoProcessingDelay: 5000,
     contactsEndpoint: 'https://services.leadconnectorhq.com/contacts',
     conversationContextTtlMs: 45 * 1000,
+    conversationIntentTtlMs: 10 * 1000,
     attachmentValidationMaxAttempts: 4,
     attachmentValidationBaseDelayMs: 1200,
     attachmentValidationFetchLimit: 30
@@ -1183,6 +1184,177 @@
   let pendingObservedEntriesTimer = null;
   const conversationContextCache = new Map();
   const conversationContextInflight = new Map();
+  let conversationIntentTrackingInitialized = false;
+  const conversationIntentState = {
+    active: false,
+    armedAt: 0,
+    hintConversationId: null,
+    source: null
+  };
+
+  function normalizeConversationId(value) {
+    if (value === undefined || value === null) return null;
+    const normalized = String(value).trim();
+    return normalized || null;
+  }
+
+  function isLikelyConversationId(value) {
+    const normalized = normalizeConversationId(value);
+    if (!normalized) return false;
+    return /^[A-Za-z0-9_-]{10,}$/.test(normalized);
+  }
+
+  function clearConversationIntent(reason = 'resolved') {
+    const wasActive = conversationIntentState.active;
+    conversationIntentState.active = false;
+    conversationIntentState.armedAt = 0;
+    conversationIntentState.hintConversationId = null;
+    conversationIntentState.source = null;
+
+    if (wasActive) {
+      log(`[Context Resolver] Intent limpo (${reason})`);
+    }
+  }
+
+  function isConversationIntentActive() {
+    if (!conversationIntentState.active) return false;
+
+    if (Date.now() - conversationIntentState.armedAt > CONFIG.conversationIntentTtlMs) {
+      clearConversationIntent('expired');
+      return false;
+    }
+
+    return true;
+  }
+
+  function armConversationIntent(conversationIdHint = null, source = 'user-click') {
+    const normalizedHint = normalizeConversationId(conversationIdHint);
+    const safeHint = isLikelyConversationId(normalizedHint) ? normalizedHint : null;
+
+    conversationIntentState.active = true;
+    conversationIntentState.armedAt = Date.now();
+    conversationIntentState.hintConversationId = safeHint;
+    conversationIntentState.source = source;
+
+    log('[Context Resolver] Intent armado:', {
+      hintConversationId: conversationIntentState.hintConversationId,
+      source: conversationIntentState.source
+    });
+  }
+
+  function isConversationListClick(target) {
+    if (!target || !(target instanceof Element)) return false;
+    return Boolean(target.closest('#conversations-list, .conversation-list-container, [id*="conversations-list"]'));
+  }
+
+  function resolveConversationIdFromElement(target) {
+    if (!target || !(target instanceof Element)) return null;
+
+    const directAttributeKeys = [
+      'data-conversation-id',
+      'data-conversationid',
+      'data-thread-id',
+      'data-threadid',
+      'conversation-id'
+    ];
+
+    let current = target;
+    let depth = 0;
+    while (current && depth < 9) {
+      for (const attributeKey of directAttributeKeys) {
+        const attributeValue = current.getAttribute(attributeKey);
+        const normalizedAttribute = normalizeConversationId(attributeValue);
+        if (!normalizedAttribute) continue;
+
+        const parsedFromUrl = parseConversationIdFromUrl(normalizedAttribute);
+        const candidate = parsedFromUrl || normalizedAttribute;
+        if (isLikelyConversationId(candidate)) {
+          return candidate;
+        }
+      }
+
+      if (current.dataset) {
+        const datasetCandidates = [
+          current.dataset.conversationId,
+          current.dataset.threadId
+        ];
+
+        for (const datasetCandidate of datasetCandidates) {
+          const normalizedDataset = normalizeConversationId(datasetCandidate);
+          if (!normalizedDataset) continue;
+
+          const parsedFromUrl = parseConversationIdFromUrl(normalizedDataset);
+          const candidate = parsedFromUrl || normalizedDataset;
+          if (isLikelyConversationId(candidate)) {
+            return candidate;
+          }
+        }
+      }
+
+      const href = current.getAttribute('href') || current.getAttribute('data-href');
+      if (href) {
+        const parsedFromHref = parseConversationIdFromUrl(href);
+        if (parsedFromHref && isLikelyConversationId(parsedFromHref)) {
+          return parsedFromHref;
+        }
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return null;
+  }
+
+  function isHighConfidenceConversationSource(source = '') {
+    if (!source) return false;
+    return (
+      source.includes(':conversation') ||
+      source.includes(':messages') ||
+      source.includes('message-search')
+    );
+  }
+
+  function shouldAcceptConversationIdCandidate(candidateConversationId, source = 'network') {
+    const candidate = normalizeConversationId(candidateConversationId);
+    if (!candidate) return false;
+
+    if (candidate === conversationResolverState.conversationId) return true;
+
+    const urlConversationId = parseConversationIdFromUrl(window.location.href);
+    if (urlConversationId) {
+      return candidate === urlConversationId;
+    }
+
+    if (isConversationIntentActive()) {
+      if (conversationIntentState.hintConversationId) {
+        return candidate === conversationIntentState.hintConversationId;
+      }
+
+      if (source.includes('search-v2')) return false;
+      return isHighConfidenceConversationSource(source);
+    }
+
+    if (conversationResolverState.conversationId) {
+      return false;
+    }
+
+    if (source.includes('search-v2')) return false;
+    return isHighConfidenceConversationSource(source);
+  }
+
+  function initConversationIntentTracking() {
+    if (conversationIntentTrackingInitialized) return;
+    conversationIntentTrackingInitialized = true;
+
+    document.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!isConversationListClick(target)) return;
+
+      const hintedConversationId = resolveConversationIdFromElement(target);
+      armConversationIntent(hintedConversationId, 'user-list-click');
+    }, true);
+  }
 
   function resetConversationResolverForNavigation(source = 'network:navigation') {
     const keysToReset = [
@@ -1209,6 +1381,8 @@
       conversationResolverState.updatedAt = Date.now();
       log('[Context Resolver] Estado de conversa resetado por navegação');
     }
+
+    clearConversationIntent('navigation');
   }
 
   function mergeResolverState(partialState, source = 'network') {
@@ -1225,31 +1399,46 @@
       'assignedTo',
       'searchTypeHint'
     ];
+    const conversationScopedKeys = [
+      'contactId',
+      'conversationType',
+      'conversationProviderId',
+      'lastMessageType',
+      'lastMessageConversationProviderId',
+      'assignedTo',
+      'searchTypeHint'
+    ];
+    const sanitizedState = { ...partialState };
+
+    const candidateConversationId = normalizeConversationId(sanitizedState.conversationId);
+    if (candidateConversationId) {
+      const shouldAccept = shouldAcceptConversationIdCandidate(candidateConversationId, source);
+
+      if (!shouldAccept) {
+        log(`[Context Resolver] ConversationId ignorado (${candidateConversationId}) via ${source}`);
+        sanitizedState.conversationId = null;
+        for (const key of conversationScopedKeys) {
+          sanitizedState[key] = null;
+        }
+      } else {
+        sanitizedState.conversationId = candidateConversationId;
+      }
+    }
 
     let changed = false;
 
     // Quando a conversa muda, limpa campos acoplados à conversa anterior
     // para evitar uso de contact/provider stale entre requisições.
     const hasNewConversationId =
-      partialState.conversationId !== undefined &&
-      partialState.conversationId !== null &&
-      partialState.conversationId !== '';
+      sanitizedState.conversationId !== undefined &&
+      sanitizedState.conversationId !== null &&
+      sanitizedState.conversationId !== '';
     const conversationChanged =
       hasNewConversationId &&
       conversationResolverState.conversationId &&
-      partialState.conversationId !== conversationResolverState.conversationId;
+      sanitizedState.conversationId !== conversationResolverState.conversationId;
 
     if (conversationChanged) {
-      const conversationScopedKeys = [
-        'contactId',
-        'conversationType',
-        'conversationProviderId',
-        'lastMessageType',
-        'lastMessageConversationProviderId',
-        'assignedTo',
-        'searchTypeHint'
-      ];
-
       for (const key of conversationScopedKeys) {
         if (conversationResolverState[key] !== null) {
           conversationResolverState[key] = null;
@@ -1259,9 +1448,9 @@
     }
 
     for (const key of allowedKeys) {
-      if (partialState[key] === undefined || partialState[key] === null || partialState[key] === '') continue;
-      if (conversationResolverState[key] !== partialState[key]) {
-        conversationResolverState[key] = partialState[key];
+      if (sanitizedState[key] === undefined || sanitizedState[key] === null || sanitizedState[key] === '') continue;
+      if (conversationResolverState[key] !== sanitizedState[key]) {
+        conversationResolverState[key] = sanitizedState[key];
         changed = true;
       }
     }
@@ -1277,6 +1466,19 @@
         conversationProviderId: conversationResolverState.conversationProviderId,
         source: conversationResolverState.source
       });
+    }
+
+    if (
+      sanitizedState.conversationId &&
+      conversationResolverState.conversationId === sanitizedState.conversationId &&
+      isConversationIntentActive()
+    ) {
+      if (
+        !conversationIntentState.hintConversationId ||
+        conversationIntentState.hintConversationId === sanitizedState.conversationId
+      ) {
+        clearConversationIntent(`resolved:${source}`);
+      }
     }
   }
 
@@ -3397,6 +3599,9 @@
   function init() {
     log('Iniciando script de upload de mídias...');
 
+    // Captura intenção explícita de clique na lista de conversas.
+    initConversationIntentTracking();
+
     if (!checkDomain()) {
       log('URL atual não corresponde. Aguardando navegação para a location correta...');
       return;
@@ -3441,6 +3646,10 @@
 
       // Evita reutilizar contexto de conversa anterior até a nova hidratação via network.
       resetConversationResolverForNavigation('network:url-change');
+
+      // Prioriza os próximos eventos de rede da conversa navegada pelo usuário.
+      const urlConversationId = parseConversationIdFromUrl(currentUrl);
+      armConversationIntent(urlConversationId, urlConversationId ? 'url-change-hint' : 'url-change');
 
       // Re-tentar inicialização quando URL mudar
       setTimeout(() => {
