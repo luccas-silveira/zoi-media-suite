@@ -39,7 +39,16 @@
     attachmentValidationFetchLimit: 30,
     sendItemMaxAttempts: 3,
     sendItemRetryDelayMs: 900,
-    sendRecoveryWindowMs: 4 * 60 * 1000
+    sendRecoveryWindowMs: 4 * 60 * 1000,
+    diagnosticsEnabled: true,
+    diagnosticsStorageKey: 'media_upload_diagnostics_v1',
+    diagnosticsMaxOperations: 80,
+    diagnosticsMaxEventsPerOperation: 260,
+    diagnosticsMaxResolverEvents: 500,
+    diagnosticsMaxIncidents: 300,
+    diagnosticsMaxNetworkEvents: 800,
+    diagnosticsPersistDebounceMs: 1800,
+    diagnosticsRetentionMs: 3 * 24 * 60 * 60 * 1000
   };
 
   // Armazenar arquivos selecionados
@@ -88,6 +97,526 @@
     if (CONFIG.debugMode) {
       console.log('[Media Upload]', message, ...args);
     }
+  }
+
+  // ============================================
+  // 2.1 DIAGNOSTICS / TELEMETRIA
+  // ============================================
+
+  const diagnosticsState = {
+    version: 1,
+    sessionId: null,
+    createdAt: null,
+    operations: [],
+    incidents: [],
+    resolverEvents: [],
+    networkEvents: [],
+    seq: 0
+  };
+  let diagnosticsPersistTimer = null;
+  let diagnosticsInitialized = false;
+
+  const DIAGNOSTIC_HEADER_KEYS = new Set([
+    'x-request-id',
+    'x-amzn-trace-id',
+    'trace-id',
+    'traceid',
+    'cf-ray',
+    'x-correlation-id'
+  ]);
+
+  function diagnosticsNowIso() {
+    return new Date().toISOString();
+  }
+
+  function sanitizeDiagnosticText(value, maxLength = 280) {
+    if (value === undefined || value === null) return null;
+    const text = String(value).replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    if (text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength)}...`;
+  }
+
+  function sanitizeDiagnosticError(error) {
+    if (!error) return null;
+    const safe = {
+      name: sanitizeDiagnosticText(error.name || 'Error', 80),
+      message: sanitizeDiagnosticText(error.message || String(error), 300)
+    };
+
+    if (error.stack) {
+      const firstLines = String(error.stack).split('\n').slice(0, 3).join('\n');
+      safe.stack = sanitizeDiagnosticText(firstLines, 500);
+    }
+
+    return safe;
+  }
+
+  function sanitizeDiagnosticUrl(urlString) {
+    if (!urlString) return null;
+    try {
+      const url = new URL(urlString, window.location.origin);
+      const queryWhitelist = [
+        'conversationId',
+        'conversation_id',
+        'locationId',
+        'location_id',
+        'contactId',
+        'contact_id',
+        'type',
+        'altId',
+        'alt_id',
+        'parentId',
+        'limit'
+      ];
+      const query = {};
+      for (const key of queryWhitelist) {
+        const value = url.searchParams.get(key);
+        if (value) {
+          query[key] = sanitizeDiagnosticText(value, 140);
+        }
+      }
+
+      return {
+        origin: url.origin,
+        path: url.pathname,
+        query
+      };
+    } catch (error) {
+      return {
+        raw: sanitizeDiagnosticText(urlString, 500)
+      };
+    }
+  }
+
+  function detectBodyType(body) {
+    if (!body) return 'none';
+    if (typeof body === 'string') return 'string';
+    if (typeof FormData !== 'undefined' && body instanceof FormData) return 'form-data';
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return 'url-search-params';
+    if (typeof Blob !== 'undefined' && body instanceof Blob) return 'blob';
+    if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) return 'array-buffer';
+    return typeof body;
+  }
+
+  function pickDiagnosticHeaders(headers) {
+    const picked = {};
+    if (!headers || typeof headers.forEach !== 'function') return picked;
+
+    headers.forEach((value, key) => {
+      const normalizedKey = String(key || '').toLowerCase();
+      if (!DIAGNOSTIC_HEADER_KEYS.has(normalizedKey)) return;
+      picked[normalizedKey] = sanitizeDiagnosticText(value, 200);
+    });
+    return picked;
+  }
+
+  function diagnosticsNextSeq() {
+    diagnosticsState.seq += 1;
+    return diagnosticsState.seq;
+  }
+
+  function createDiagnosticsBaseState() {
+    return {
+      version: 1,
+      sessionId: buildOperationId('diag-session'),
+      createdAt: diagnosticsNowIso(),
+      operations: [],
+      incidents: [],
+      resolverEvents: [],
+      networkEvents: [],
+      seq: 0
+    };
+  }
+
+  function pruneDiagnosticsState() {
+    const now = Date.now();
+    const cutoff = now - CONFIG.diagnosticsRetentionMs;
+
+    diagnosticsState.operations = diagnosticsState.operations
+      .filter(operation => {
+        const ts = Date.parse(operation.startedAt || operation.createdAt || '');
+        if (!Number.isFinite(ts)) return true;
+        return ts >= cutoff;
+      })
+      .slice(-CONFIG.diagnosticsMaxOperations);
+
+    diagnosticsState.incidents = diagnosticsState.incidents
+      .filter(incident => {
+        const ts = Date.parse(incident.at || '');
+        if (!Number.isFinite(ts)) return true;
+        return ts >= cutoff;
+      })
+      .slice(-CONFIG.diagnosticsMaxIncidents);
+
+    diagnosticsState.resolverEvents = diagnosticsState.resolverEvents
+      .filter(event => {
+        const ts = Date.parse(event.at || '');
+        if (!Number.isFinite(ts)) return true;
+        return ts >= cutoff;
+      })
+      .slice(-CONFIG.diagnosticsMaxResolverEvents);
+
+    diagnosticsState.networkEvents = diagnosticsState.networkEvents
+      .filter(event => {
+        const ts = Date.parse(event.at || '');
+        if (!Number.isFinite(ts)) return true;
+        return ts >= cutoff;
+      })
+      .slice(-CONFIG.diagnosticsMaxNetworkEvents);
+
+    diagnosticsState.operations.forEach(operation => {
+      if (!Array.isArray(operation.events)) {
+        operation.events = [];
+        return;
+      }
+      operation.events = operation.events.slice(-CONFIG.diagnosticsMaxEventsPerOperation);
+    });
+  }
+
+  function persistDiagnosticsState() {
+    if (!CONFIG.diagnosticsEnabled) return;
+    try {
+      pruneDiagnosticsState();
+      window.localStorage.setItem(CONFIG.diagnosticsStorageKey, JSON.stringify(diagnosticsState));
+    } catch (error) {
+      log('[Diagnostics] Falha ao persistir estado:', error);
+    }
+  }
+
+  function queueDiagnosticsPersist() {
+    if (!CONFIG.diagnosticsEnabled) return;
+    if (diagnosticsPersistTimer) return;
+
+    diagnosticsPersistTimer = setTimeout(() => {
+      diagnosticsPersistTimer = null;
+      persistDiagnosticsState();
+    }, CONFIG.diagnosticsPersistDebounceMs);
+  }
+
+  function initDiagnosticsState() {
+    if (!CONFIG.diagnosticsEnabled || diagnosticsInitialized) return;
+    diagnosticsInitialized = true;
+
+    let nextState = createDiagnosticsBaseState();
+    try {
+      const raw = window.localStorage.getItem(CONFIG.diagnosticsStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.operations)) {
+          nextState = {
+            ...nextState,
+            ...parsed,
+            operations: Array.isArray(parsed.operations) ? parsed.operations : [],
+            incidents: Array.isArray(parsed.incidents) ? parsed.incidents : [],
+            resolverEvents: Array.isArray(parsed.resolverEvents) ? parsed.resolverEvents : [],
+            networkEvents: Array.isArray(parsed.networkEvents) ? parsed.networkEvents : [],
+            seq: Number.isFinite(parsed.seq) ? parsed.seq : 0
+          };
+        }
+      }
+    } catch (error) {
+      log('[Diagnostics] Falha ao carregar estado salvo:', error);
+    }
+
+    diagnosticsState.version = nextState.version || 1;
+    diagnosticsState.sessionId = buildOperationId('diag-session');
+    diagnosticsState.createdAt = nextState.createdAt || diagnosticsNowIso();
+    diagnosticsState.operations = nextState.operations || [];
+    diagnosticsState.incidents = nextState.incidents || [];
+    diagnosticsState.resolverEvents = nextState.resolverEvents || [];
+    diagnosticsState.networkEvents = nextState.networkEvents || [];
+    diagnosticsState.seq = Number.isFinite(nextState.seq) ? nextState.seq : 0;
+
+    pruneDiagnosticsState();
+    queueDiagnosticsPersist();
+  }
+
+  function findDiagnosticsOperation(operationId) {
+    if (!operationId) return null;
+    return diagnosticsState.operations.find(operation => operation.operationId === operationId) || null;
+  }
+
+  function beginDiagnosticsOperation(operationContext, payload = {}) {
+    if (!CONFIG.diagnosticsEnabled || !operationContext?.operationId) return;
+    initDiagnosticsState();
+
+    let operation = findDiagnosticsOperation(operationContext.operationId);
+    if (!operation) {
+      operation = {
+        operationId: operationContext.operationId,
+        source: sanitizeDiagnosticText(operationContext.source || payload.source || 'unknown', 80),
+        startedAt: diagnosticsNowIso(),
+        status: 'running',
+        expectedConversationId: sanitizeDiagnosticText(operationContext.expectedConversationId, 140),
+        expectedContactId: sanitizeDiagnosticText(operationContext.expectedContactId, 140),
+        expectedLocationId: sanitizeDiagnosticText(operationContext.expectedLocationId, 140),
+        expectedConversationProviderId: sanitizeDiagnosticText(operationContext.expectedConversationProviderId, 140),
+        events: []
+      };
+      diagnosticsState.operations.push(operation);
+    }
+
+    const event = {
+      seq: diagnosticsNextSeq(),
+      at: diagnosticsNowIso(),
+      type: 'operation_started',
+      payload: {
+        ...payload,
+        source: sanitizeDiagnosticText(operationContext.source || payload.source || 'unknown', 80)
+      }
+    };
+    operation.events.push(event);
+    pruneDiagnosticsState();
+    queueDiagnosticsPersist();
+  }
+
+  function updateDiagnosticsOperationContext(operationContext, partial = {}) {
+    if (!CONFIG.diagnosticsEnabled || !operationContext?.operationId) return;
+    initDiagnosticsState();
+
+    const operation = findDiagnosticsOperation(operationContext.operationId);
+    if (!operation) return;
+
+    const merged = { ...operationContext, ...partial };
+    operation.expectedConversationId = sanitizeDiagnosticText(merged.expectedConversationId, 140);
+    operation.expectedContactId = sanitizeDiagnosticText(merged.expectedContactId, 140);
+    operation.expectedLocationId = sanitizeDiagnosticText(merged.expectedLocationId, 140);
+    operation.expectedConversationProviderId = sanitizeDiagnosticText(merged.expectedConversationProviderId, 140);
+    queueDiagnosticsPersist();
+  }
+
+  function appendDiagnosticsOperationEvent(operationId, type, payload = {}) {
+    if (!CONFIG.diagnosticsEnabled || !operationId) return;
+    initDiagnosticsState();
+
+    const operation = findDiagnosticsOperation(operationId);
+    if (!operation) return;
+
+    operation.events.push({
+      seq: diagnosticsNextSeq(),
+      at: diagnosticsNowIso(),
+      type: sanitizeDiagnosticText(type, 80) || 'event',
+      payload
+    });
+
+    if (operation.events.length > CONFIG.diagnosticsMaxEventsPerOperation) {
+      operation.events = operation.events.slice(-CONFIG.diagnosticsMaxEventsPerOperation);
+    }
+    queueDiagnosticsPersist();
+  }
+
+  function finalizeDiagnosticsOperation(operationContext, status = 'completed', summary = {}) {
+    if (!CONFIG.diagnosticsEnabled || !operationContext?.operationId) return;
+    initDiagnosticsState();
+
+    const operation = findDiagnosticsOperation(operationContext.operationId);
+    if (!operation) return;
+
+    operation.status = sanitizeDiagnosticText(status, 40) || 'completed';
+    operation.endedAt = diagnosticsNowIso();
+    operation.summary = summary;
+
+    appendDiagnosticsOperationEvent(operationContext.operationId, 'operation_finished', {
+      status: operation.status,
+      summary
+    });
+    queueDiagnosticsPersist();
+  }
+
+  function recordDiagnosticsIncident(type, payload = {}, operationContext = null) {
+    if (!CONFIG.diagnosticsEnabled) return;
+    initDiagnosticsState();
+
+    const incident = {
+      seq: diagnosticsNextSeq(),
+      at: diagnosticsNowIso(),
+      type: sanitizeDiagnosticText(type, 80) || 'incident',
+      operationId: operationContext?.operationId || payload?.operationId || null,
+      payload
+    };
+
+    diagnosticsState.incidents.push(incident);
+    if (incident.operationId) {
+      appendDiagnosticsOperationEvent(incident.operationId, `incident:${incident.type}`, payload);
+    }
+
+    pruneDiagnosticsState();
+    queueDiagnosticsPersist();
+  }
+
+  function recordResolverDiagnostic(eventType, payload = {}) {
+    if (!CONFIG.diagnosticsEnabled) return;
+    initDiagnosticsState();
+
+    diagnosticsState.resolverEvents.push({
+      seq: diagnosticsNextSeq(),
+      at: diagnosticsNowIso(),
+      eventType: sanitizeDiagnosticText(eventType, 80) || 'resolver_event',
+      payload
+    });
+
+    if (diagnosticsState.resolverEvents.length > CONFIG.diagnosticsMaxResolverEvents) {
+      diagnosticsState.resolverEvents = diagnosticsState.resolverEvents.slice(-CONFIG.diagnosticsMaxResolverEvents);
+    }
+    queueDiagnosticsPersist();
+  }
+
+  function recordNetworkDiagnostic(networkEvent = {}) {
+    if (!CONFIG.diagnosticsEnabled) return;
+    initDiagnosticsState();
+
+    diagnosticsState.networkEvents.push({
+      seq: diagnosticsNextSeq(),
+      at: diagnosticsNowIso(),
+      ...networkEvent
+    });
+
+    if (diagnosticsState.networkEvents.length > CONFIG.diagnosticsMaxNetworkEvents) {
+      diagnosticsState.networkEvents = diagnosticsState.networkEvents.slice(-CONFIG.diagnosticsMaxNetworkEvents);
+    }
+    queueDiagnosticsPersist();
+  }
+
+  function buildResponseDiagnostics(response) {
+    if (!response) return {};
+    return {
+      status: response.status,
+      ok: response.ok,
+      redirected: Boolean(response.redirected),
+      requestIdHeaders: pickDiagnosticHeaders(response.headers)
+    };
+  }
+
+  async function fetchWithDiagnostics(url, init = {}, meta = {}) {
+    const method = String(init?.method || 'GET').toUpperCase();
+    const supportsPerformanceNow = typeof performance !== 'undefined' && typeof performance.now === 'function';
+    const startedAt = supportsPerformanceNow ? performance.now() : Date.now();
+    const operationId = meta?.operationId || null;
+    const stage = sanitizeDiagnosticText(meta?.stage || 'request', 120);
+    const endpoint = sanitizeDiagnosticUrl(url);
+
+    try {
+      const response = await fetch(url, init);
+      const elapsedMs = (supportsPerformanceNow ? performance.now() : Date.now()) - startedAt;
+      const durationMs = Number(elapsedMs.toFixed(1));
+      const responseMeta = buildResponseDiagnostics(response);
+
+      recordNetworkDiagnostic({
+        category: sanitizeDiagnosticText(meta?.category || 'network', 80),
+        stage,
+        operationId,
+        method,
+        url: endpoint,
+        durationMs,
+        bodyType: detectBodyType(init?.body),
+        ...responseMeta
+      });
+
+      if (operationId) {
+        appendDiagnosticsOperationEvent(operationId, `network:${stage}`, {
+          category: sanitizeDiagnosticText(meta?.category || 'network', 80),
+          method,
+          url: endpoint,
+          durationMs,
+          ...responseMeta
+        });
+      }
+
+      return response;
+    } catch (error) {
+      const elapsedMs = (supportsPerformanceNow ? performance.now() : Date.now()) - startedAt;
+      const durationMs = Number(elapsedMs.toFixed(1));
+      const safeError = sanitizeDiagnosticError(error);
+
+      recordNetworkDiagnostic({
+        category: sanitizeDiagnosticText(meta?.category || 'network', 80),
+        stage,
+        operationId,
+        method,
+        url: endpoint,
+        durationMs,
+        bodyType: detectBodyType(init?.body),
+        error: safeError
+      });
+
+      if (operationId) {
+        appendDiagnosticsOperationEvent(operationId, `network_error:${stage}`, {
+          category: sanitizeDiagnosticText(meta?.category || 'network', 80),
+          method,
+          url: endpoint,
+          durationMs,
+          error: safeError
+        });
+      }
+
+      throw error;
+    }
+  }
+
+  function getDiagnosticsSnapshot() {
+    initDiagnosticsState();
+    pruneDiagnosticsState();
+
+    const snapshot = {
+      generatedAt: diagnosticsNowIso(),
+      version: diagnosticsState.version,
+      sessionId: diagnosticsState.sessionId,
+      operations: diagnosticsState.operations,
+      incidents: diagnosticsState.incidents,
+      resolverEvents: diagnosticsState.resolverEvents,
+      networkEvents: diagnosticsState.networkEvents
+    };
+
+    try {
+      if (typeof conversationResolverState !== 'undefined' && conversationResolverState) {
+        snapshot.currentResolverState = { ...conversationResolverState };
+      }
+    } catch (error) {
+      // no-op
+    }
+
+    return snapshot;
+  }
+
+  function clearDiagnosticsSnapshot() {
+    const fresh = createDiagnosticsBaseState();
+    diagnosticsState.version = fresh.version;
+    diagnosticsState.sessionId = fresh.sessionId;
+    diagnosticsState.createdAt = fresh.createdAt;
+    diagnosticsState.operations = [];
+    diagnosticsState.incidents = [];
+    diagnosticsState.resolverEvents = [];
+    diagnosticsState.networkEvents = [];
+    diagnosticsState.seq = 0;
+    queueDiagnosticsPersist();
+  }
+
+  function downloadDiagnosticsSnapshot(fileName = null) {
+    const snapshot = getDiagnosticsSnapshot();
+    const safeFileName = fileName || `media-upload-diagnostics-${Date.now()}.json`;
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = safeFileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1200);
+    return safeFileName;
+  }
+
+  function exposeDiagnosticsApi() {
+    if (!CONFIG.diagnosticsEnabled) return;
+    initDiagnosticsState();
+
+    window.MediaUploadDiagnostics = {
+      getSnapshot: () => getDiagnosticsSnapshot(),
+      downloadSnapshot: (fileName) => downloadDiagnosticsSnapshot(fileName),
+      clearSnapshot: () => clearDiagnosticsSnapshot(),
+      getLatestIncident: () => diagnosticsState.incidents[diagnosticsState.incidents.length - 1] || null
+    };
   }
 
   // ============================================
@@ -1230,6 +1759,8 @@
 
   function clearConversationIntent(reason = 'resolved') {
     const wasActive = conversationIntentState.active;
+    const previousHint = conversationIntentState.hintConversationId;
+    const previousSource = conversationIntentState.source;
     conversationIntentState.active = false;
     conversationIntentState.armedAt = 0;
     conversationIntentState.hintConversationId = null;
@@ -1237,6 +1768,11 @@
 
     if (wasActive) {
       log(`[Context Resolver] Intent limpo (${reason})`);
+      recordResolverDiagnostic('intent_cleared', {
+        reason,
+        previousHintConversationId: previousHint || null,
+        previousSource: previousSource || null
+      });
     }
   }
 
@@ -1263,6 +1799,10 @@
     log('[Context Resolver] Intent armado:', {
       hintConversationId: conversationIntentState.hintConversationId,
       source: conversationIntentState.source
+    });
+    recordResolverDiagnostic('intent_armed', {
+      source,
+      hintConversationId: conversationIntentState.hintConversationId || null
     });
   }
 
@@ -1624,6 +2164,10 @@
       conversationResolverState.source = source;
       conversationResolverState.updatedAt = Date.now();
       log('[Context Resolver] Estado de conversa resetado por navegação');
+      recordResolverDiagnostic('resolver_reset_navigation', {
+        source,
+        state: { ...conversationResolverState }
+      });
     }
 
     clearConversationIntent('navigation');
@@ -1661,6 +2205,11 @@
 
       if (!shouldAccept) {
         log(`[Context Resolver] ConversationId ignorado (${candidateConversationId}) via ${source}`);
+        recordResolverDiagnostic('conversation_candidate_rejected', {
+          candidateConversationId,
+          source,
+          currentConversationId: conversationResolverState.conversationId || null
+        });
         sanitizedState.conversationId = null;
         for (const key of conversationScopedKeys) {
           sanitizedState[key] = null;
@@ -1684,6 +2233,11 @@
 
       if (!shouldAcceptLocation) {
         log(`[Context Resolver] LocationId ignorado (${candidateLocationId}) via ${source}`);
+        recordResolverDiagnostic('location_candidate_rejected', {
+          candidateLocationId,
+          source,
+          currentLocationId: conversationResolverState.locationId || null
+        });
         sanitizedState.locationId = null;
       } else {
         sanitizedState.locationId = candidateLocationId;
@@ -1760,6 +2314,10 @@
         lastMessageType: conversationResolverState.lastMessageType,
         conversationProviderId: conversationResolverState.conversationProviderId,
         source: conversationResolverState.source
+      });
+      recordResolverDiagnostic('resolver_state_updated', {
+        source,
+        state: { ...conversationResolverState }
       });
     }
 
@@ -2244,6 +2802,130 @@
     return { ...conversationResolverState };
   }
 
+  function normalizeEntityId(value) {
+    if (value === undefined || value === null) return null;
+    const normalized = String(value).trim();
+    return normalized || null;
+  }
+
+  function buildOperationId(prefix = 'media-upload') {
+    const randomPart = Math.random().toString(36).slice(2, 8);
+    return `${prefix}-${Date.now().toString(36)}-${randomPart}`;
+  }
+
+  function createOperationContext(conversationContext = {}, source = 'media-upload') {
+    const operationContext = {
+      operationId: buildOperationId(source),
+      source,
+      startedAt: Date.now(),
+      startedAtIso: diagnosticsNowIso(),
+      expectedConversationId: normalizeConversationId(conversationContext.conversationId),
+      expectedContactId: normalizeEntityId(conversationContext.contactId),
+      expectedLocationId: normalizeLocationId(conversationContext.locationId),
+      expectedConversationProviderId: normalizeEntityId(
+        conversationContext.conversationProviderId ||
+        conversationContext.lastMessageConversationProviderId ||
+        null
+      )
+    };
+
+    beginDiagnosticsOperation(operationContext, {
+      expectedConversationId: sanitizeDiagnosticText(operationContext.expectedConversationId, 140),
+      expectedContactId: sanitizeDiagnosticText(operationContext.expectedContactId, 140),
+      expectedLocationId: sanitizeDiagnosticText(operationContext.expectedLocationId, 140),
+      expectedConversationProviderId: sanitizeDiagnosticText(operationContext.expectedConversationProviderId, 140),
+      page: sanitizeDiagnosticText(window.location.href, 240)
+    });
+
+    return operationContext;
+  }
+
+  function evaluateOperationContextDrift(operationContext, resolverSnapshot = null) {
+    if (!operationContext || typeof operationContext !== 'object') {
+      return {
+        ok: true,
+        reasons: [],
+        snapshot: resolverSnapshot || getResolverSnapshot()
+      };
+    }
+
+    const snapshot = resolverSnapshot || getResolverSnapshot();
+    const reasons = [];
+
+    if (
+      operationContext.expectedConversationId &&
+      snapshot.conversationId &&
+      snapshot.conversationId !== operationContext.expectedConversationId
+    ) {
+      reasons.push(
+        `conversationId ativo mudou (${operationContext.expectedConversationId} -> ${snapshot.conversationId})`
+      );
+    }
+
+    if (
+      operationContext.expectedLocationId &&
+      snapshot.locationId &&
+      snapshot.locationId !== operationContext.expectedLocationId
+    ) {
+      reasons.push(
+        `locationId ativo mudou (${operationContext.expectedLocationId} -> ${snapshot.locationId})`
+      );
+    }
+
+    if (
+      operationContext.expectedConversationId &&
+      snapshot.conversationId === operationContext.expectedConversationId &&
+      operationContext.expectedContactId &&
+      snapshot.contactId &&
+      snapshot.contactId !== operationContext.expectedContactId
+    ) {
+      reasons.push(
+        `contactId ativo mudou (${operationContext.expectedContactId} -> ${snapshot.contactId})`
+      );
+    }
+
+    if (
+      operationContext.expectedConversationProviderId &&
+      snapshot.conversationProviderId &&
+      snapshot.conversationProviderId !== operationContext.expectedConversationProviderId
+    ) {
+      reasons.push(
+        `conversationProviderId ativo mudou (` +
+        `${operationContext.expectedConversationProviderId} -> ${snapshot.conversationProviderId})`
+      );
+    }
+
+    return {
+      ok: reasons.length === 0,
+      reasons,
+      snapshot
+    };
+  }
+
+  function assertOperationContextStable(operationContext, stageLabel = 'processamento') {
+    if (!operationContext) return;
+
+    const drift = evaluateOperationContextDrift(operationContext);
+    if (drift.ok) return;
+
+    const details = drift.reasons.join('; ');
+    log(`[Guardrail] Drift de contexto detectado em ${stageLabel}: ${details}`, drift.snapshot);
+    appendDiagnosticsOperationEvent(operationContext.operationId, 'context_drift_detected', {
+      stage: sanitizeDiagnosticText(stageLabel, 120),
+      reasons: drift.reasons,
+      snapshot: drift.snapshot
+    });
+    recordDiagnosticsIncident('context_drift_detected', {
+      stage: sanitizeDiagnosticText(stageLabel, 120),
+      reasons: drift.reasons,
+      resolverSnapshot: drift.snapshot
+    }, operationContext);
+    throw new Error(
+      `Envio interrompido por segurança: a conversa ativa mudou durante ${stageLabel}. ` +
+      `Reabra a conversa desejada e tente novamente.`
+    );
+  }
+
   function pruneConversationContextCache(now = Date.now()) {
     for (const [conversationId, cachedEntry] of conversationContextCache.entries()) {
       if (!cachedEntry || cachedEntry.expiresAt <= now) {
@@ -2287,19 +2969,30 @@
   // 12. BUSCAR CONTACT ID DA CONVERSA
   // ============================================
 
-  async function getConversationContext(conversationId) {
+  async function getConversationContext(conversationId, options = {}) {
     if (!conversationId) {
       throw new Error('ConversationId é obrigatório para obter o contexto.');
     }
+    const operationContext = options.operationContext || null;
 
     const cachedContext = getCachedConversationContext(conversationId);
     if (cachedContext) {
       log(`Contexto da conversa ${conversationId} carregado do cache`);
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'conversation_context_cache_hit', {
+          conversationId: sanitizeDiagnosticText(conversationId, 140)
+        });
+      }
       return cachedContext;
     }
 
     if (conversationContextInflight.has(conversationId)) {
       log(`Reutilizando busca de contexto em andamento para ${conversationId}`);
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'conversation_context_inflight_reused', {
+          conversationId: sanitizeDiagnosticText(conversationId, 140)
+        });
+      }
       return conversationContextInflight.get(conversationId);
     }
 
@@ -2325,12 +3018,16 @@
       try {
         log(`Buscando dados da conversa: ${conversationId}`);
 
-        const conversationResponse = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}`, {
+        const conversationResponse = await fetchWithDiagnostics(`${CONFIG.getMessagesEndpoint}/${conversationId}`, {
           method: 'GET',
           headers: {
             'Authorization': `Bearer ${CONFIG.apiKey}`,
             'Version': CONFIG.apiVersion
           }
+        }, {
+          operationId: operationContext?.operationId || null,
+          stage: 'context_fetch_conversation',
+          category: 'conversation_context'
         });
 
         if (!conversationResponse.ok) {
@@ -2394,12 +3091,16 @@
         try {
           log(`Buscando última mensagem da conversa: ${conversationId}`);
 
-          const messagesResponse = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=1`, {
+          const messagesResponse = await fetchWithDiagnostics(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=1`, {
             method: 'GET',
             headers: {
               'Authorization': `Bearer ${CONFIG.apiKey}`,
               'Version': CONFIG.apiVersion
             }
+          }, {
+            operationId: operationContext?.operationId || null,
+            stage: 'context_fetch_latest_message',
+            category: 'conversation_context'
           });
 
           if (!messagesResponse.ok) {
@@ -2467,6 +3168,16 @@
         lastMessageType: context.lastMessageType,
         searchTypeHint: context.searchTypeHint
       }, 'conversation-context');
+
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'conversation_context_resolved', {
+          conversationId: sanitizeDiagnosticText(context.conversationId, 140),
+          contactId: sanitizeDiagnosticText(context.contactId, 140),
+          locationId: sanitizeDiagnosticText(context.locationId, 140),
+          messageType: sanitizeDiagnosticText(context.messageType, 40),
+          conversationProviderId: sanitizeDiagnosticText(context.conversationProviderId, 140)
+        });
+      }
 
       setCachedConversationContext(conversationId, context);
       return { ...context };
@@ -2553,21 +3264,27 @@
   // 14. FAZER UPLOAD DE UM ARQUIVO
   // ============================================
 
-  async function uploadFile(file, conversationId) {
+  async function uploadFile(file, conversationId, options = {}) {
     try {
+      const operationContext = options.operationContext || null;
+      const stageLabel = options.stageLabel || 'upload de arquivo';
       log(`Iniciando upload do arquivo: ${file.name}`);
 
       const formData = new FormData();
       formData.append('conversationId', conversationId);
       formData.append('fileAttachment', file);
 
-      const response = await fetch(CONFIG.uploadEndpoint, {
+      const response = await fetchWithDiagnostics(CONFIG.uploadEndpoint, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${CONFIG.apiKey}`,
           'Version': CONFIG.apiVersion
         },
         body: formData
+      }, {
+        operationId: operationContext?.operationId || null,
+        stage: `upload_file:${sanitizeDiagnosticText(stageLabel, 80) || 'file'}`,
+        category: 'media_upload'
       });
 
       if (!response.ok) {
@@ -2598,10 +3315,27 @@
         throw new Error('URL do arquivo não foi retornada pela API');
       }
 
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'upload_file_completed', {
+          stage: sanitizeDiagnosticText(stageLabel, 80),
+          fileName: sanitizeDiagnosticText(file.name, 160),
+          fileSize: Number.isFinite(file.size) ? file.size : null
+        });
+      }
+
       return fileUrl;
 
     } catch (error) {
       log(`ERRO ao fazer upload do arquivo ${file.name}:`, error);
+      if (options.operationContext?.operationId) {
+        recordDiagnosticsIncident('file_upload_failed', {
+          stage: sanitizeDiagnosticText(options.stageLabel || 'upload de arquivo', 120),
+          fileName: sanitizeDiagnosticText(file.name, 160),
+          fileSize: Number.isFinite(file.size) ? file.size : null,
+          conversationId: sanitizeDiagnosticText(conversationId, 140),
+          error: sanitizeDiagnosticError(error)
+        }, options.operationContext);
+      }
       throw error;
     }
   }
@@ -2610,21 +3344,41 @@
   // 14.1 UPLOAD DE VÍDEO GRANDE VIA MEDIA STORAGE
   // ============================================
 
-  async function uploadFileToMediaStorage(file) {
+  async function uploadFileToMediaStorage(file, options = {}) {
     try {
+      const operationContext = options.operationContext || null;
+      const stageLabel = options.stageLabel || 'upload de vídeo via Media Storage';
+      if (operationContext) {
+        assertOperationContextStable(operationContext, `${stageLabel} (pré-upload)`);
+      }
+
       const sizeMB = (file.size / 1024 / 1024).toFixed(2);
       log(`Iniciando upload via Media Storage: ${file.name} (${sizeMB}MB)`);
 
-      const locationId = getLocationId();
+      const preferredLocationId = normalizeLocationId(options.locationId);
+      const observedLocationId = getLocationId();
+      const locationId = preferredLocationId || observedLocationId;
       if (!locationId) {
         throw new Error('Location ID não encontrado via network para upload via Media Storage');
+      }
+
+      if (preferredLocationId && observedLocationId && preferredLocationId !== observedLocationId) {
+        log(
+          `[Guardrail] Divergência de locationId detectada durante upload de vídeo. ` +
+          `Congelado=${preferredLocationId}, Atual=${observedLocationId}. Usando valor congelado.`
+        );
+        recordDiagnosticsIncident('location_drift_during_media_storage_upload', {
+          stage: sanitizeDiagnosticText(stageLabel, 120),
+          frozenLocationId: sanitizeDiagnosticText(preferredLocationId, 140),
+          observedLocationId: sanitizeDiagnosticText(observedLocationId, 140)
+        }, operationContext);
       }
 
       const formData = new FormData();
       formData.append('file', file);
       formData.append('hosted', 'false');
 
-      const response = await fetch(
+      const response = await fetchWithDiagnostics(
         `${CONFIG.mediaUploadEndpoint}?altId=${locationId}&altType=location`,
         {
           method: 'POST',
@@ -2633,6 +3387,11 @@
             'Version': CONFIG.apiVersion
           },
           body: formData
+        },
+        {
+          operationId: operationContext?.operationId || null,
+          stage: `upload_media_storage:${sanitizeDiagnosticText(stageLabel, 80) || 'video'}`,
+          category: 'media_storage_upload'
         }
       );
 
@@ -2651,11 +3410,30 @@
         throw new Error('URL do arquivo não foi retornada pela API de Media Storage');
       }
 
+      if (operationContext) {
+        assertOperationContextStable(operationContext, `${stageLabel} (pós-upload)`);
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'media_storage_upload_completed', {
+          stage: sanitizeDiagnosticText(stageLabel, 120),
+          fileName: sanitizeDiagnosticText(file.name, 160),
+          fileSize: Number.isFinite(file.size) ? file.size : null,
+          locationId: sanitizeDiagnosticText(locationId, 140)
+        });
+      }
+
       log(`URL do Media Storage: ${fileUrl}`);
       return fileUrl;
 
     } catch (error) {
       log(`ERRO ao fazer upload via Media Storage ${file.name}:`, error);
+      if (options.operationContext?.operationId) {
+        recordDiagnosticsIncident('media_storage_upload_failed', {
+          stage: sanitizeDiagnosticText(options.stageLabel || 'upload de vídeo via Media Storage', 120),
+          fileName: sanitizeDiagnosticText(file.name, 160),
+          fileSize: Number.isFinite(file.size) ? file.size : null,
+          locationId: sanitizeDiagnosticText(options.locationId, 140),
+          error: sanitizeDiagnosticError(error)
+        }, options.operationContext);
+      }
       throw error;
     }
   }
@@ -2765,9 +3543,17 @@
   async function wasSendItemDelivered(conversationId, item, options = {}) {
     if (!conversationId || !item) return false;
     const notBeforeMs = Number(options.notBeforeMs || 0);
+    const operationContext = options.operationContext || null;
 
     try {
-      const recentMessages = await fetchRecentMessages(conversationId, CONFIG.attachmentValidationFetchLimit);
+      const recentMessages = await fetchRecentMessages(
+        conversationId,
+        CONFIG.attachmentValidationFetchLimit,
+        {
+          operationContext,
+          stage: 'recovery_fetch_recent_messages'
+        }
+      );
       if (!Array.isArray(recentMessages) || recentMessages.length === 0) return false;
 
       const scopedMessages = filterMessagesByTimestamp(recentMessages, notBeforeMs);
@@ -2787,13 +3573,13 @@
     return false;
   }
 
-  async function sendMessageItem(payload, item, recoveryState, conversationId) {
+  async function sendMessageItem(payload, item, recoveryState, conversationId, operationContext = null) {
     let lastError = null;
     const recoveryNotBeforeMs = recoveryState ? recoveryState.createdAt - 15000 : 0;
 
     for (let attempt = 1; attempt <= CONFIG.sendItemMaxAttempts; attempt++) {
       try {
-        const response = await fetch(CONFIG.sendEndpoint, {
+        const response = await fetchWithDiagnostics(CONFIG.sendEndpoint, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${CONFIG.apiKey}`,
@@ -2801,6 +3587,10 @@
             'Version': CONFIG.apiVersion
           },
           body: JSON.stringify(payload)
+        }, {
+          operationId: operationContext?.operationId || null,
+          stage: `send_message_item:${sanitizeDiagnosticText(item?.type || 'unknown', 40) || 'unknown'}`,
+          category: 'chat_send'
         });
 
         if (!response.ok) {
@@ -2810,13 +3600,29 @@
 
         const result = await response.json().catch(() => ({}));
         markRecoveryItemCompleted(recoveryState, item.key);
+        if (operationContext?.operationId) {
+          appendDiagnosticsOperationEvent(operationContext.operationId, 'send_item_completed', {
+            itemKey: sanitizeDiagnosticText(item.key, 120),
+            itemType: sanitizeDiagnosticText(item.type, 40),
+            attempt
+          });
+        }
         return result;
       } catch (error) {
         lastError = error;
         log(`[Send Retry] ${item.label} falhou na tentativa ${attempt}/${CONFIG.sendItemMaxAttempts}:`, error);
+        if (operationContext?.operationId) {
+          appendDiagnosticsOperationEvent(operationContext.operationId, 'send_item_retry', {
+            itemKey: sanitizeDiagnosticText(item.key, 120),
+            itemType: sanitizeDiagnosticText(item.type, 40),
+            attempt,
+            error: sanitizeDiagnosticError(error)
+          });
+        }
 
         const deliveredAfterFailure = await wasSendItemDelivered(conversationId, item, {
-          notBeforeMs: recoveryNotBeforeMs
+          notBeforeMs: recoveryNotBeforeMs,
+          operationContext
         });
         if (deliveredAfterFailure) {
           log(`[Send Recovery] ${item.label} já estava entregue após falha de rede.`);
@@ -2833,13 +3639,19 @@
     throw lastError || new Error(`Falha ao enviar ${item.label}`);
   }
 
-  async function sendMessageWithAttachments(attachmentUrls, messageText, conversationContext) {
+  async function sendMessageWithAttachments(attachmentUrls, messageText, conversationContext, operationContext = null) {
     const conversationId = conversationContext?.conversationId || null;
     const operationFingerprint = buildSendOperationFingerprint(messageText, attachmentUrls);
     const recoveryState = getOrCreateSendRecoveryState(conversationId, operationFingerprint);
 
     try {
       log('Enviando mensagens com anexos...');
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'send_with_attachments_started', {
+          attachmentCount: Array.isArray(attachmentUrls) ? attachmentUrls.length : 0,
+          hasText: Boolean(normalizeMessageTextForComparison(messageText))
+        });
+      }
 
       if (!conversationId) {
         throw new Error('ConversationId ausente no contexto de envio.');
@@ -2901,21 +3713,34 @@
       for (const item of queue) {
         if (recoveryState && recoveryState.completedItemKeys.has(item.key)) {
           log(`[Send Recovery] Pulando ${item.label} (já concluído anteriormente).`);
+          if (operationContext?.operationId) {
+            appendDiagnosticsOperationEvent(operationContext.operationId, 'send_item_skipped_recovery', {
+              itemKey: sanitizeDiagnosticText(item.key, 120),
+              itemType: sanitizeDiagnosticText(item.type, 40)
+            });
+          }
           continue;
         }
 
         if (isRecoveryMode) {
           const alreadyDelivered = await wasSendItemDelivered(conversationId, item, {
-            notBeforeMs: recoveryNotBeforeMs
+            notBeforeMs: recoveryNotBeforeMs,
+            operationContext
           });
           if (alreadyDelivered) {
             log(`[Send Recovery] ${item.label} já estava entregue, marcado como concluído.`);
             markRecoveryItemCompleted(recoveryState, item.key);
+            if (operationContext?.operationId) {
+              appendDiagnosticsOperationEvent(operationContext.operationId, 'send_item_marked_delivered_by_recovery', {
+                itemKey: sanitizeDiagnosticText(item.key, 120),
+                itemType: sanitizeDiagnosticText(item.type, 40)
+              });
+            }
             continue;
           }
         }
 
-        const itemResult = await sendMessageItem(item.payload, item, recoveryState, conversationId);
+        const itemResult = await sendMessageItem(item.payload, item, recoveryState, conversationId, operationContext);
         if (itemResult) {
           results.push(itemResult);
         }
@@ -2923,6 +3748,11 @@
 
       clearSendRecoveryState(conversationId);
       log('Todas as mensagens foram enviadas:', results);
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'send_with_attachments_completed', {
+          resultCount: Array.isArray(results) ? results.length : 0
+        });
+      }
       return results;
     } catch (error) {
       if (recoveryState) {
@@ -2931,6 +3761,12 @@
       }
 
       log('ERRO ao enviar mensagens:', error);
+      if (operationContext?.operationId) {
+        recordDiagnosticsIncident('send_with_attachments_failed', {
+          error: sanitizeDiagnosticError(error),
+          conversationId: sanitizeDiagnosticText(conversationId, 140)
+        }, operationContext);
+      }
       throw error;
     }
   }
@@ -3014,13 +3850,20 @@
     return Array.from(new Set(collected));
   }
 
-  async function fetchRecentMessages(conversationId, limit = CONFIG.attachmentValidationFetchLimit) {
-    const response = await fetch(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=${limit}`, {
+  async function fetchRecentMessages(conversationId, limit = CONFIG.attachmentValidationFetchLimit, options = {}) {
+    const operationContext = options.operationContext || null;
+    const stage = sanitizeDiagnosticText(options.stage || 'fetch_recent_messages', 120);
+
+    const response = await fetchWithDiagnostics(`${CONFIG.getMessagesEndpoint}/${conversationId}/messages?limit=${limit}`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${CONFIG.apiKey}`,
         'Version': CONFIG.apiVersion
       }
+    }, {
+      operationId: operationContext?.operationId || null,
+      stage,
+      category: 'conversation_messages'
     });
 
     if (!response.ok) {
@@ -3236,6 +4079,7 @@
       ? expectedAttachmentUrls.filter(url => typeof url === 'string' && url.trim())
       : [];
     const notBeforeMs = Number(options.notBeforeMs || 0);
+    const operationContext = options.operationContext || null;
 
     if (expectedUrls.length === 0) {
       return {
@@ -3258,7 +4102,10 @@
 
     for (let attempt = 1; attempt <= CONFIG.attachmentValidationMaxAttempts; attempt++) {
       try {
-        const messages = await fetchRecentMessages(conversationId, CONFIG.attachmentValidationFetchLimit);
+        const messages = await fetchRecentMessages(conversationId, CONFIG.attachmentValidationFetchLimit, {
+          operationContext,
+          stage: `attachment_validation_attempt_${attempt}`
+        });
         lastEvaluation = evaluateAttachmentDelivery(messages, expectedUrls, { notBeforeMs });
 
         log(
@@ -3267,6 +4114,16 @@
           `(${lastEvaluation.deliveredByUrl.length} por URL, ` +
           `${lastEvaluation.deliveredBySignature.length} por assinatura)`
         );
+        if (operationContext?.operationId) {
+          appendDiagnosticsOperationEvent(operationContext.operationId, 'attachment_validation_attempt', {
+            attempt,
+            deliveredCount: lastEvaluation.deliveredUrls.length,
+            expectedCount: expectedUrls.length,
+            missingCount: lastEvaluation.missingUrls.length,
+            deliveredByUrlCount: lastEvaluation.deliveredByUrl.length,
+            deliveredBySignatureCount: lastEvaluation.deliveredBySignature.length
+          });
+        }
 
         if (lastEvaluation.missingUrls.length === 0) {
           return {
@@ -3281,6 +4138,12 @@
       } catch (error) {
         lastError = error;
         log(`[Validação de anexos] Erro na tentativa ${attempt}:`, error);
+        if (operationContext?.operationId) {
+          appendDiagnosticsOperationEvent(operationContext.operationId, 'attachment_validation_error', {
+            attempt,
+            error: sanitizeDiagnosticError(error)
+          });
+        }
       }
 
       if (attempt < CONFIG.attachmentValidationMaxAttempts) {
@@ -3299,14 +4162,25 @@
     };
   }
 
-  async function uploadFilesWithProgress(files, conversationId, sendBtn) {
+  async function uploadFilesWithProgress(files, conversationId, sendBtn, operationContext = null) {
     const uploadedUrls = [];
 
     for (let index = 0; index < files.length; index++) {
+      if (operationContext) {
+        assertOperationContextStable(operationContext, `upload de imagens/áudios (${index + 1}/${files.length})`);
+      }
+
       const file = files[index];
       sendBtn.innerHTML = `Upload de imagens/áudios (${index + 1}/${files.length})...`;
-      const uploadedUrl = await uploadFile(file, conversationId);
+      const uploadedUrl = await uploadFile(file, conversationId, {
+        operationContext,
+        stageLabel: `upload de imagens/áudios ${index + 1}/${files.length}`
+      });
       uploadedUrls.push(uploadedUrl);
+
+      if (operationContext) {
+        assertOperationContextStable(operationContext, `pós-upload de imagens/áudios (${index + 1}/${files.length})`);
+      }
     }
 
     return uploadedUrls;
@@ -3331,11 +4205,13 @@
    * @param {string} videoUrl - URL do vídeo
    * @returns {Promise<Object>} Resposta da API
    */
-  async function updateContactCustomField(contactId, videoUrl) {
+  async function updateContactCustomField(contactId, videoUrl, options = {}) {
     try {
+      const operationContext = options.operationContext || null;
+      const stageLabel = options.stageLabel || 'update_contact_custom_field';
       log(`Atualizando custom field do contato ${contactId}`);
 
-      const response = await fetch(`${CONFIG.contactsEndpoint}/${contactId}`, {
+      const response = await fetchWithDiagnostics(`${CONFIG.contactsEndpoint}/${contactId}`, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${CONFIG.apiKey}`,
@@ -3350,6 +4226,10 @@
             }
           ]
         })
+      }, {
+        operationId: operationContext?.operationId || null,
+        stage: sanitizeDiagnosticText(stageLabel, 120),
+        category: 'contact_update'
       });
 
       if (!response.ok) {
@@ -3359,10 +4239,23 @@
 
       const result = await response.json();
       log('Custom field atualizado com sucesso');
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'contact_custom_field_updated', {
+          contactId: sanitizeDiagnosticText(contactId, 140),
+          stage: sanitizeDiagnosticText(stageLabel, 120)
+        });
+      }
       return result;
 
     } catch (error) {
       log(`ERRO ao atualizar custom field:`, error);
+      if (options.operationContext?.operationId) {
+        recordDiagnosticsIncident('contact_custom_field_update_failed', {
+          contactId: sanitizeDiagnosticText(contactId, 140),
+          stage: sanitizeDiagnosticText(options.stageLabel || 'update_contact_custom_field', 120),
+          error: sanitizeDiagnosticError(error)
+        }, options.operationContext);
+      }
       throw error;
     }
   }
@@ -3372,11 +4265,13 @@
    * @param {string} contactId - ID do contato
    * @returns {Promise<Object>} Resposta da API
    */
-  async function addContactToWorkflow(contactId) {
+  async function addContactToWorkflow(contactId, options = {}) {
     try {
+      const operationContext = options.operationContext || null;
+      const stageLabel = options.stageLabel || 'add_contact_to_workflow';
       log(`Adicionando contato ${contactId} ao workflow`);
 
-      const response = await fetch(
+      const response = await fetchWithDiagnostics(
         `${CONFIG.contactsEndpoint}/${contactId}/workflow/${CONFIG.workflowId}`,
         {
           method: 'POST',
@@ -3386,6 +4281,11 @@
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({})
+        },
+        {
+          operationId: operationContext?.operationId || null,
+          stage: sanitizeDiagnosticText(stageLabel, 120),
+          category: 'workflow'
         }
       );
 
@@ -3396,10 +4296,23 @@
 
       const result = await response.json();
       log('Contato adicionado ao workflow com sucesso');
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'workflow_started_for_contact', {
+          contactId: sanitizeDiagnosticText(contactId, 140),
+          stage: sanitizeDiagnosticText(stageLabel, 120)
+        });
+      }
       return result;
 
     } catch (error) {
       log(`ERRO ao adicionar contato ao workflow:`, error);
+      if (options.operationContext?.operationId) {
+        recordDiagnosticsIncident('workflow_add_contact_failed', {
+          contactId: sanitizeDiagnosticText(contactId, 140),
+          stage: sanitizeDiagnosticText(options.stageLabel || 'add_contact_to_workflow', 120),
+          error: sanitizeDiagnosticError(error)
+        }, options.operationContext);
+      }
       throw error;
     }
   }
@@ -3412,11 +4325,36 @@
    * @param {HTMLButtonElement} sendBtn - Botão de envio (para atualizar UI)
    * @returns {Promise<Array>} Array com resultados do processamento
    */
-  async function processVideos(videoFiles, conversationId, contactId, sendBtn) {
+  async function processVideos(videoFiles, conversationId, contactId, sendBtn, operationContext = null) {
     const results = [];
 
     try {
       log(`Processando ${videoFiles.length} vídeo(s)`);
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'video_processing_started', {
+          videoCount: videoFiles.length,
+          contactId: sanitizeDiagnosticText(contactId, 140),
+          conversationId: sanitizeDiagnosticText(conversationId, 140)
+        });
+      }
+      const frozenLocationId = normalizeLocationId(operationContext?.expectedLocationId);
+      const hasLargeUploadVideo = videoFiles.some(file => file && !file.galleryUrl && file.size > CONFIG.maxFileSize);
+      if (hasLargeUploadVideo && !frozenLocationId) {
+        if (operationContext?.operationId) {
+          recordDiagnosticsIncident('missing_frozen_location_for_large_video', {
+            conversationId: sanitizeDiagnosticText(conversationId, 140),
+            contactId: sanitizeDiagnosticText(contactId, 140)
+          }, operationContext);
+        }
+        throw new Error(
+          'Não foi possível congelar o locationId para upload de vídeo grande. ' +
+          'Reabra a conversa e tente novamente.'
+        );
+      }
+
+      if (operationContext) {
+        assertOperationContextStable(operationContext, 'início do processamento de vídeos');
+      }
 
       for (let i = 0; i < videoFiles.length; i++) {
         const videoFile = videoFiles[i];
@@ -3424,6 +4362,9 @@
 
         try {
           let videoUrl;
+          if (operationContext) {
+            assertOperationContextStable(operationContext, `processamento do vídeo ${videoNumber}/${videoFiles.length}`);
+          }
 
           // Verificar se o vídeo veio da galeria (já tem URL)
           if (videoFile.galleryUrl) {
@@ -3433,24 +4374,59 @@
             // Vídeo grande (>5MB): usar Media Storage (limite 500MB)
             sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload (Media Storage)...`;
             log(`[Vídeo ${videoNumber}] Vídeo grande (${(videoFile.size / 1024 / 1024).toFixed(2)}MB), usando Media Storage: ${videoFile.name}`);
-            videoUrl = await uploadFileToMediaStorage(videoFile);
+            videoUrl = await uploadFileToMediaStorage(videoFile, {
+              locationId: frozenLocationId,
+              operationContext,
+              stageLabel: `upload do vídeo ${videoNumber}/${videoFiles.length}`
+            });
           } else {
             // Vídeo pequeno (<=5MB): usar endpoint de conversas
             sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Upload...`;
             log(`[Vídeo ${videoNumber}] Fazendo upload de arquivo local: ${videoFile.name}`);
-            videoUrl = await uploadFile(videoFile, conversationId);
+            videoUrl = await uploadFile(videoFile, conversationId, {
+              operationContext,
+              stageLabel: `upload do vídeo ${videoNumber}/${videoFiles.length}`
+            });
+          }
+
+          if (operationContext) {
+            assertOperationContextStable(operationContext, `pré-atualização de contato (vídeo ${videoNumber}/${videoFiles.length})`);
           }
 
           // Update custom field
           sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Atualizando contato...`;
-          await updateContactCustomField(contactId, videoUrl);
+          await updateContactCustomField(contactId, videoUrl, {
+            operationContext,
+            stageLabel: `update_contact_video_${videoNumber}/${videoFiles.length}`
+          });
+
+          if (operationContext) {
+            assertOperationContextStable(operationContext, `pré-workflow (vídeo ${videoNumber}/${videoFiles.length})`);
+          }
 
           // Add to workflow
           sendBtn.innerHTML = `Processando vídeo ${videoNumber}/${videoFiles.length}: Ativando workflow...`;
-          await addContactToWorkflow(contactId);
+          await addContactToWorkflow(contactId, {
+            operationContext,
+            stageLabel: `start_workflow_video_${videoNumber}/${videoFiles.length}`
+          });
+
+          if (operationContext) {
+            assertOperationContextStable(operationContext, `pós-workflow (vídeo ${videoNumber}/${videoFiles.length})`);
+          }
 
           results.push({ file: videoFile.name, url: videoUrl, success: true });
           log(`[Vídeo ${videoNumber}] Processado com sucesso`);
+          if (operationContext?.operationId) {
+            appendDiagnosticsOperationEvent(operationContext.operationId, 'video_processed', {
+              index: videoNumber,
+              total: videoFiles.length,
+              fileName: sanitizeDiagnosticText(videoFile.name, 180),
+              viaGallery: Boolean(videoFile.galleryUrl),
+              viaMediaStorage: Boolean(!videoFile.galleryUrl && videoFile.size > CONFIG.maxFileSize),
+              fileSize: Number.isFinite(videoFile.size) ? videoFile.size : null
+            });
+          }
 
           // Delay antes do próximo (exceto no último)
           if (i < videoFiles.length - 1) {
@@ -3461,6 +4437,14 @@
         } catch (videoError) {
           log(`ERRO ao processar vídeo ${videoFile.name}:`, videoError);
           results.push({ file: videoFile.name, success: false, error: videoError.message });
+          if (operationContext?.operationId) {
+            recordDiagnosticsIncident('video_processing_item_failed', {
+              index: videoNumber,
+              total: videoFiles.length,
+              fileName: sanitizeDiagnosticText(videoFile.name, 180),
+              error: sanitizeDiagnosticError(videoError)
+            }, operationContext);
+          }
 
           const continueProcessing = confirm(
             `Erro ao processar vídeo "${videoFile.name}":\n${videoError.message}\n\nContinuar com próximos?`
@@ -3470,6 +4454,14 @@
             throw new Error(`Processamento interrompido`);
           }
         }
+      }
+
+      if (operationContext?.operationId) {
+        appendDiagnosticsOperationEvent(operationContext.operationId, 'video_processing_finished', {
+          total: videoFiles.length,
+          successCount: results.filter(result => result.success).length,
+          failureCount: results.filter(result => !result.success).length
+        });
       }
 
       return results;
@@ -4052,6 +5044,7 @@
     const sendBtn = document.getElementById('modal-send-btn');
     const messageTextarea = document.getElementById('message-text');
     const originalBtnText = sendBtn.innerHTML;
+    let operationContext = null;
 
     try {
       // Adicionar mídias da galeria à fila, se houver seleções
@@ -4077,14 +5070,62 @@
         throw new Error('Não foi possível identificar a conversa via network. Abra a conversa e aguarde carregar as mensagens.');
       }
 
+      operationContext = createOperationContext({ conversationId }, 'send-files');
+      appendDiagnosticsOperationEvent(operationContext.operationId, 'send_flow_started', {
+        selectedFileCount: selectedFiles.length,
+        conversationId: sanitizeDiagnosticText(conversationId, 140)
+      });
+
       // Buscar contexto completo da conversa
       sendBtn.innerHTML = 'Buscando informações...';
-      const conversationContext = await getConversationContext(conversationId);
-      const contactId = conversationContext.contactId;
+      const conversationContext = await getConversationContext(conversationId, { operationContext });
+      if (!operationContext.expectedConversationId) {
+        operationContext.expectedConversationId = conversationId;
+      }
+      if (!operationContext.expectedLocationId) {
+        const resolverSnapshot = getResolverSnapshot();
+        const fallbackLocationId = normalizeLocationId(resolverSnapshot.locationId || null);
+        if (fallbackLocationId) {
+          operationContext.expectedLocationId = fallbackLocationId;
+        }
+      }
+
+      assertOperationContextStable(operationContext, 'início do envio');
+
+      const lockedConversationId = operationContext.expectedConversationId || conversationId;
+      const lockedContactId = operationContext.expectedContactId || conversationContext.contactId;
+      if (!lockedContactId) {
+        throw new Error('Não foi possível congelar o contactId para o envio.');
+      }
+      if (!operationContext.expectedContactId) {
+        operationContext.expectedContactId = lockedContactId;
+      }
+      if (!operationContext.expectedConversationProviderId && conversationContext.conversationProviderId) {
+        operationContext.expectedConversationProviderId = normalizeEntityId(conversationContext.conversationProviderId);
+      }
+      updateDiagnosticsOperationContext(operationContext);
+      appendDiagnosticsOperationEvent(operationContext.operationId, 'operation_context_locked', {
+        conversationId: sanitizeDiagnosticText(operationContext.expectedConversationId, 140),
+        contactId: sanitizeDiagnosticText(operationContext.expectedContactId, 140),
+        locationId: sanitizeDiagnosticText(operationContext.expectedLocationId, 140),
+        conversationProviderId: sanitizeDiagnosticText(operationContext.expectedConversationProviderId, 140)
+      });
+
+      conversationContext.conversationId = lockedConversationId;
+      conversationContext.contactId = lockedContactId;
+      if (operationContext.expectedLocationId && !conversationContext.locationId) {
+        conversationContext.locationId = operationContext.expectedLocationId;
+      }
+
+      const contactId = lockedContactId;
       const messageType = conversationContext.messageType;
       const messageText = messageTextarea ? messageTextarea.value.trim() : '';
 
-      log(`Processando envio - ConversationId: ${conversationId}, ContactId: ${contactId}, Type: ${messageType}, Provider: ${conversationContext.conversationProviderId || 'n/a'}`);
+      log(
+        `Processando envio - ConversationId: ${lockedConversationId}, ContactId: ${contactId}, ` +
+        `Type: ${messageType}, Provider: ${conversationContext.conversationProviderId || 'n/a'}, ` +
+        `OpId: ${operationContext.operationId}`
+      );
 
       // ========================================
       // SEPARAR VÍDEOS DE OUTRAS MÍDIAS
@@ -4102,17 +5143,26 @@
       if (nonVideoFiles.length > 0) {
         log('Processando imagens/áudios para envio no chat');
 
+        assertOperationContextStable(operationContext, 'pré-upload de imagens/áudios');
         sendBtn.innerHTML = `Upload de imagens/áudios (0/${nonVideoFiles.length})...`;
-        const nonVideoUrls = await uploadFilesWithProgress(nonVideoFiles, conversationId, sendBtn);
+        const nonVideoUrls = await uploadFilesWithProgress(
+          nonVideoFiles,
+          lockedConversationId,
+          sendBtn,
+          operationContext
+        );
         log('Upload de imagens/áudios concluído:', nonVideoUrls);
 
+        assertOperationContextStable(operationContext, 'pré-envio de imagens/áudios no chat');
         sendBtn.innerHTML = 'Enviando mensagens...';
         const sendStartedAt = Date.now();
-        await sendMessageWithAttachments(nonVideoUrls, messageText, conversationContext);
+        await sendMessageWithAttachments(nonVideoUrls, messageText, conversationContext, operationContext);
 
+        assertOperationContextStable(operationContext, 'pré-validação de imagens/áudios no chat');
         sendBtn.innerHTML = 'Validando envio das mídias...';
-        const deliveryValidation = await validateAttachmentDelivery(conversationId, nonVideoUrls, {
-          notBeforeMs: sendStartedAt - 15000
+        const deliveryValidation = await validateAttachmentDelivery(lockedConversationId, nonVideoUrls, {
+          notBeforeMs: sendStartedAt - 15000,
+          operationContext
         });
         if (!deliveryValidation.ok) {
           log('Falha na validação de entrega das mídias:', deliveryValidation);
@@ -4133,12 +5183,14 @@
 
       if (videoFiles.length > 0) {
         log('Processando vídeos via custom field + workflow');
+        assertOperationContextStable(operationContext, 'pré-processamento de vídeos');
 
         const videoResults = await processVideos(
           videoFiles,
-          conversationId,
+          lockedConversationId,
           contactId,
-          sendBtn
+          sendBtn,
+          operationContext
         );
 
         // Verificar se houve erros
@@ -4160,6 +5212,13 @@
 
       sendBtn.innerHTML = '✓ Enviado!';
       log('Processo completo! Todos os arquivos foram processados.');
+      if (operationContext) {
+        finalizeDiagnosticsOperation(operationContext, 'success', {
+          selectedFileCount: selectedFiles.length,
+          videoCount: videoFiles.length,
+          nonVideoCount: nonVideoFiles.length
+        });
+      }
 
       // Fechar modal após 1 segundo
       setTimeout(() => {
@@ -4172,6 +5231,16 @@
 
     } catch (error) {
       log('ERRO no processo de envio:', error);
+      if (operationContext) {
+        recordDiagnosticsIncident('send_flow_failed', {
+          error: sanitizeDiagnosticError(error),
+          page: sanitizeDiagnosticText(window.location.href, 240),
+          resolverSnapshot: getResolverSnapshot()
+        }, operationContext);
+        finalizeDiagnosticsOperation(operationContext, 'failed', {
+          error: sanitizeDiagnosticText(error?.message || String(error), 280)
+        });
+      }
       sendBtn.innerHTML = '✗ Erro no envio';
       sendBtn.style.background = '#ef4444';
 
@@ -4301,6 +5370,11 @@
 
   function init() {
     log('Iniciando script de upload de mídias...');
+    exposeDiagnosticsApi();
+    recordResolverDiagnostic('script_init', {
+      url: sanitizeDiagnosticText(window.location.href, 260),
+      hostname: sanitizeDiagnosticText(window.location.hostname, 120)
+    });
 
     // Captura intenção explícita de clique na lista de conversas.
     initConversationIntentTracking();
@@ -4344,8 +5418,13 @@
   function checkUrlChange() {
     const currentUrl = window.location.href;
     if (currentUrl !== lastUrl) {
+      const previousUrl = lastUrl;
       lastUrl = currentUrl;
       log('URL mudou para:', currentUrl);
+      recordResolverDiagnostic('url_changed', {
+        previousUrl: sanitizeDiagnosticText(previousUrl, 240),
+        currentUrl: sanitizeDiagnosticText(currentUrl, 240)
+      });
 
       // Evita reutilizar contexto de conversa anterior até a nova hidratação via network.
       resetConversationResolverForNavigation('network:url-change');
@@ -4379,6 +5458,12 @@
 
   // Fallback: verificar URL periodicamente (para SPAs que não usam history API)
   setInterval(checkUrlChange, CONFIG.urlPollInterval);
+
+  if (CONFIG.diagnosticsEnabled) {
+    window.addEventListener('beforeunload', () => {
+      persistDiagnosticsState();
+    });
+  }
 
   // ============================================
   // 22. EXECUTAR SCRIPT
