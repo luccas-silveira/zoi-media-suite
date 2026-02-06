@@ -101,6 +101,15 @@
     return true;
   }
 
+  function isModalOpen() {
+    return Boolean(document.getElementById('custom-media-upload-modal'));
+  }
+
+  function getModalElement(id) {
+    if (!isModalOpen()) return null;
+    return document.getElementById(id);
+  }
+
   // ============================================
   // 4. CRIAR MODAL/POPUP
   // ============================================
@@ -196,9 +205,12 @@
       </div>
     `;
 
-    // Adicionar estilos
-    const style = document.createElement('style');
-    style.textContent = `
+    // Adicionar estilos uma única vez (evita vazamento de <style> no head)
+    let style = document.getElementById('custom-media-upload-modal-style');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'custom-media-upload-modal-style';
+      style.textContent = `
       #custom-media-upload-modal {
         position: fixed;
         top: 0;
@@ -837,8 +849,9 @@
         font-size: 14px;
       }
     `;
+      document.head.appendChild(style);
+    }
 
-    document.head.appendChild(style);
     document.body.appendChild(modal);
 
     setupModalEventListeners();
@@ -1171,6 +1184,33 @@
   const conversationContextCache = new Map();
   const conversationContextInflight = new Map();
 
+  function resetConversationResolverForNavigation(source = 'network:navigation') {
+    const keysToReset = [
+      'conversationId',
+      'contactId',
+      'conversationType',
+      'conversationProviderId',
+      'lastMessageType',
+      'lastMessageConversationProviderId',
+      'assignedTo',
+      'searchTypeHint'
+    ];
+
+    let changed = false;
+    for (const key of keysToReset) {
+      if (conversationResolverState[key] !== null) {
+        conversationResolverState[key] = null;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      conversationResolverState.source = source;
+      conversationResolverState.updatedAt = Date.now();
+      log('[Context Resolver] Estado de conversa resetado por navegação');
+    }
+  }
+
   function mergeResolverState(partialState, source = 'network') {
     if (!partialState || typeof partialState !== 'object') return;
 
@@ -1374,6 +1414,11 @@
     };
   }
 
+  function extractRecordConversationId(record) {
+    if (!record || typeof record !== 'object') return null;
+    return record.conversationId || record.id || null;
+  }
+
   function processContextFromUrl(urlString, source = 'network:url') {
     if (!urlString) return;
 
@@ -1403,11 +1448,23 @@
 
     // /conversations/search/v2 => lista de conversas
     if (Array.isArray(payload.conversations) && payload.conversations.length > 0) {
-      let conversationRecord = payload.conversations[0];
-      if (conversationResolverState.conversationId) {
-        conversationRecord =
-          payload.conversations.find(item => item.id === conversationResolverState.conversationId) ||
-          conversationRecord;
+      const targetConversationId =
+        parseConversationIdFromUrl(urlString) ||
+        payload.conversationId ||
+        conversationResolverState.conversationId ||
+        null;
+
+      if (!targetConversationId) {
+        return;
+      }
+
+      const conversationRecord =
+        payload.conversations.find(item =>
+          item && (item.id === targetConversationId || item.conversationId === targetConversationId)
+        ) || null;
+
+      if (!conversationRecord) {
+        return;
       }
 
       const partial = mapConversationRecordToResolverState(conversationRecord);
@@ -1428,9 +1485,20 @@
 
     // /conversations/{conversationId}/messages
     if (payload.messages && Array.isArray(payload.messages.messages) && payload.messages.messages.length > 0) {
+      const expectedConversationId = parseConversationIdFromUrl(urlString);
       const latestMessage = payload.messages.messages[0];
+      const latestMessageConversationId = latestMessage.conversationId || null;
+
+      if (
+        expectedConversationId &&
+        latestMessageConversationId &&
+        latestMessageConversationId !== expectedConversationId
+      ) {
+        return;
+      }
+
       mergeResolverState({
-        conversationId: latestMessage.conversationId || null,
+        conversationId: latestMessageConversationId || expectedConversationId || null,
         locationId: latestMessage.locationId || null,
         contactId: latestMessage.contactId || null,
         conversationProviderId: latestMessage.conversationProviderId || null,
@@ -1684,7 +1752,7 @@
     const contextPromise = (async () => {
       const resolverSnapshot = getResolverSnapshot();
       const snapshotMatchesConversation =
-        !resolverSnapshot.conversationId || resolverSnapshot.conversationId === conversationId;
+        resolverSnapshot.conversationId === conversationId;
 
       const context = {
         conversationId,
@@ -1724,7 +1792,13 @@
             ? conversationData.conversation
             : conversationData;
 
-        if (conversationRecord && typeof conversationRecord === 'object') {
+        const conversationRecordId = extractRecordConversationId(conversationRecord);
+
+        if (
+          conversationRecord &&
+          typeof conversationRecord === 'object' &&
+          (!conversationRecordId || conversationRecordId === conversationId)
+        ) {
           if (conversationRecord.locationId) {
             context.locationId = conversationRecord.locationId;
           }
@@ -1747,6 +1821,10 @@
           if (conversationRecord.lastMessageType) {
             context.lastMessageType = conversationRecord.lastMessageType;
           }
+        } else if (conversationRecordId && conversationRecordId !== conversationId) {
+          log(
+            `Contexto da conversa ignorado por mismatch de ID. Esperado: ${conversationId}, recebido: ${conversationRecordId}`
+          );
         }
       } catch (error) {
         log('ERRO ao buscar dados da conversa:', error);
@@ -1778,13 +1856,19 @@
           const messagesResult = await messagesResponse.json();
           log('Resposta da API de mensagens:', messagesResult);
 
-          const lastMessage =
+          const messagesList =
             messagesResult &&
             messagesResult.messages &&
             messagesResult.messages.messages &&
             messagesResult.messages.messages.length > 0
-              ? messagesResult.messages.messages[0]
-              : null;
+              ? messagesResult.messages.messages
+              : [];
+
+          const lastMessage =
+            messagesList.find(message => {
+              if (!message || typeof message !== 'object') return false;
+              return !message.conversationId || message.conversationId === conversationId;
+            }) || null;
 
           if (lastMessage) {
             if (lastMessage.locationId) {
@@ -2225,12 +2309,10 @@
       .filter(url => typeof url === 'string' && url.trim())
       .map(rawUrl => ({
         rawUrl,
-        normalizedUrl: normalizeAttachmentUrl(rawUrl),
-        fileName: extractFileNameFromUrl(rawUrl)
+        normalizedUrl: normalizeAttachmentUrl(rawUrl)
       }));
 
     const observedNormalizedUrls = new Set();
-    const observedFileNames = new Set();
 
     messages.forEach(message => {
       const messageAttachmentUrls = extractAttachmentUrlsFromMessage(message);
@@ -2239,11 +2321,6 @@
         if (normalized) {
           observedNormalizedUrls.add(normalized);
         }
-
-        const fileName = extractFileNameFromUrl(url);
-        if (fileName) {
-          observedFileNames.add(fileName);
-        }
       });
     });
 
@@ -2251,12 +2328,9 @@
     const missingUrls = [];
 
     expectedDescriptors.forEach(descriptor => {
-      const deliveredByUrl =
-        descriptor.normalizedUrl && observedNormalizedUrls.has(descriptor.normalizedUrl);
-      const deliveredByFileName =
-        descriptor.fileName && observedFileNames.has(descriptor.fileName);
+      const deliveredByUrl = descriptor.normalizedUrl && observedNormalizedUrls.has(descriptor.normalizedUrl);
 
-      if (deliveredByUrl || deliveredByFileName) {
+      if (deliveredByUrl) {
         deliveredUrls.push(descriptor.rawUrl);
       } else {
         missingUrls.push(descriptor.rawUrl);
@@ -2509,15 +2583,17 @@
   // ============================================
 
   async function fetchMediaFolders() {
-    const locationId = getLocationId();
-    if (!locationId) {
-      throw new Error('Location ID não encontrado via network');
-    }
+    if (!isModalOpen()) return;
 
     mediaLibraryState.loading.folders = true;
     renderFoldersLoading();
 
     try {
+      const locationId = getLocationId();
+      if (!locationId) {
+        throw new Error('Location ID não encontrado via network');
+      }
+
       const response = await fetch(
         `${CONFIG.mediaLibraryEndpoint}?type=folder&altType=location&altId=${locationId}`,
         {
@@ -2534,6 +2610,8 @@
       }
 
       const data = await response.json();
+      if (!isModalOpen()) return;
+
       mediaLibraryState.folders = data.files || [];
       log('Pastas carregadas:', mediaLibraryState.folders.length);
 
@@ -2545,6 +2623,7 @@
           mediaLibraryState.foldersTree[folder._id] = subfolders;
           log(`Pasta "${folder.name}" tem ${subfolders.length} subpasta(s)`);
         }
+        if (!isModalOpen()) return;
       }
 
       renderFoldersList();
@@ -2603,6 +2682,8 @@
   // ============================================
 
   async function fetchMediasFromFolder(folder) {
+    if (!isModalOpen()) return;
+
     mediaLibraryState.loading.medias = true;
     mediaLibraryState.currentFolder = folder;
     renderMediasLoading();
@@ -2624,6 +2705,7 @@
       }
 
       const data = await response.json();
+      if (!isModalOpen()) return;
 
       // Filtrar apenas imagens, vídeos e áudios
       mediaLibraryState.medias = (data.files || []).filter(file => {
@@ -2649,7 +2731,9 @@
   // ============================================
 
   function renderFoldersLoading() {
-    const foldersContainer = document.getElementById('folders-list');
+    const foldersContainer = getModalElement('folders-list');
+    if (!foldersContainer) return;
+
     foldersContainer.innerHTML = `
       <div class="loading-spinner">
         <div class="spinner"></div>
@@ -2659,7 +2743,9 @@
   }
 
   function renderFoldersError(message) {
-    const foldersContainer = document.getElementById('folders-list');
+    const foldersContainer = getModalElement('folders-list');
+    if (!foldersContainer) return;
+
     foldersContainer.innerHTML = `
       <div class="empty-state" style="padding: 20px 10px;">
         <p style="font-size: 13px; color: #ef4444;">${message}</p>
@@ -2668,7 +2754,8 @@
   }
 
   function renderFoldersList() {
-    const foldersContainer = document.getElementById('folders-list');
+    const foldersContainer = getModalElement('folders-list');
+    if (!foldersContainer) return;
 
     if (mediaLibraryState.folders.length === 0) {
       foldersContainer.innerHTML = `
@@ -2822,7 +2909,9 @@
   // ============================================
 
   function renderMediasLoading() {
-    const gridContainer = document.getElementById('media-grid');
+    const gridContainer = getModalElement('media-grid');
+    if (!gridContainer) return;
+
     gridContainer.innerHTML = `
       <div class="loading-spinner">
         <div class="spinner"></div>
@@ -2832,7 +2921,9 @@
   }
 
   function renderMediasError(message) {
-    const gridContainer = document.getElementById('media-grid');
+    const gridContainer = getModalElement('media-grid');
+    if (!gridContainer) return;
+
     gridContainer.innerHTML = `
       <div class="empty-state">
         <p style="color: #ef4444;">${message}</p>
@@ -2841,7 +2932,9 @@
   }
 
   function renderMediasEmpty(message) {
-    const gridContainer = document.getElementById('media-grid');
+    const gridContainer = getModalElement('media-grid');
+    if (!gridContainer) return;
+
     gridContainer.innerHTML = `
       <div class="empty-state">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2862,8 +2955,9 @@
   }
 
   function renderMediaGrid() {
-    const gridContainer = document.getElementById('media-grid');
-    const countEl = document.getElementById('media-count');
+    const gridContainer = getModalElement('media-grid');
+    const countEl = getModalElement('media-count');
+    if (!gridContainer || !countEl) return;
 
     // Atualizar contador
     const filteredMedias = getFilteredMedias();
@@ -2876,9 +2970,10 @@
 
     gridContainer.innerHTML = filteredMedias.map(media => {
       const isSelected = mediaLibraryState.selectedMedias.some(m => m._id === media._id);
-      const isImage = media.contentType.startsWith('image/');
-      const isVideo = media.contentType.startsWith('video/');
-      const isAudio = media.contentType.startsWith('audio/');
+      const contentType = media.contentType || '';
+      const isImage = contentType.startsWith('image/');
+      const isVideo = contentType.startsWith('video/');
+      const isAudio = contentType.startsWith('audio/');
 
       let preview = '';
       if (isImage) {
@@ -2940,6 +3035,12 @@
       log(`Baixando mídia: ${media.name}`);
 
       const response = await fetch(media.url);
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        const compactError = errorText ? ` - ${errorText.slice(0, 180)}` : '';
+        throw new Error(`Erro ao baixar mídia (${response.status})${compactError}`);
+      }
+
       const blob = await response.blob();
 
       // Criar File object a partir do blob
@@ -2970,7 +3071,9 @@
       return;
     }
 
-    const sendBtn = document.getElementById('modal-send-btn');
+    const sendBtn = getModalElement('modal-send-btn');
+    if (!sendBtn) return;
+
     const originalText = sendBtn.innerHTML;
 
     try {
@@ -2978,10 +3081,13 @@
 
       // Converter cada URL em File object
       for (let i = 0; i < mediaLibraryState.selectedMedias.length; i++) {
+        if (!isModalOpen()) return;
+
         const media = mediaLibraryState.selectedMedias[i];
         sendBtn.innerHTML = `Carregando ${i + 1}/${mediaLibraryState.selectedMedias.length}...`;
 
         const file = await convertUrlToFile(media);
+        if (!isModalOpen()) return;
 
         // Adicionar à fila (mesmo fluxo de arquivos locais)
         selectedFiles.push(file);
@@ -3332,6 +3438,10 @@
     if (currentUrl !== lastUrl) {
       lastUrl = currentUrl;
       log('URL mudou para:', currentUrl);
+
+      // Evita reutilizar contexto de conversa anterior até a nova hidratação via network.
+      resetConversationResolverForNavigation('network:url-change');
+
       // Re-tentar inicialização quando URL mudar
       setTimeout(() => {
         init();
